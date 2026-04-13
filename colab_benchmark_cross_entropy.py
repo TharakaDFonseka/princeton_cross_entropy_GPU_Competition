@@ -43,6 +43,7 @@ WORKDIR = "/content"
 SUBMISSIONS = [
     "submission_2.py",
     "submission_3.py",
+    "submission_4.py",
 ]
 TEST_SCRIPT = "test_cross_entropy.py"
 
