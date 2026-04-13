@@ -2,7 +2,7 @@
 
 This repository contains work for a competition for **COS484 (NLP)** course: implement **forward and backward cross-entropy** as fast as possible on GPU. **Lower wall-clock time wins**; rankings are based on speedup over a fixed baseline, not raw loss values.
 
-## What you’re optimizing
+## What is optimized?
 
 You ship a **single Python file** that defines:
 
