@@ -213,7 +213,7 @@ python test_cross_entropy.py submission_2.py
 
 Each run: correctness for all three **V**, timings, bandwidth, geomean speedup vs eager baseline.
 
-## Google Colab — steps and commands
+## Google Colab setup — steps and commands
 
 1. **Runtime → Change runtime type → GPU** (T4/L4/A100 depending on tier).
 
@@ -251,7 +251,6 @@ Each run: correctness for all three **V**, timings, bandwidth, geomean speedup v
 
    Then restart the runtime or run the benchmark in a fresh process via `!python ...` only.
 
-   Copy the full printed table and **geomean speedup** into this journal.
 
 5. **Optional quick microbench** (single **V**, e.g. 128256 — good for A/B, not a substitute for step 4):
 
@@ -292,40 +291,6 @@ Each run: correctness for all three **V**, timings, bandwidth, geomean speedup v
        print(name, "forward ms:", f, "backward ms:", b, "sum:", f + b)
    ```
 
-## How to submit
 
-1. Install the CLI:
-```bash
-curl -fsSL https://raw.githubusercontent.com/gpu-mode/popcorn-cli/main/install.sh | bash
-```
-
-2. Register once with GitHub:
-```bash
-popcorn register github
-```
-
-3. Join the leaderboard with your invite code:
-```bash
-popcorn join <YOUR_INVITE_CODE>
-```
-
-4. Get the starter file if needed:
-```bash
-wget https://raw.githubusercontent.com/gpu-mode/reference-kernels/main/problems/princeton/cross_entropy_py/submission.py
-```
-
-5. Run a correctness check:
-```bash
-popcorn submit --leaderboard princeton_cross_entropy --gpu A100 --mode test submission.py
-```
-
-6. Submit an official ranked run (uses **`submission.py`** — currently aligned with **submission_2**):
-```bash
-popcorn submit --leaderboard princeton_cross_entropy --gpu A100 --mode leaderboard submission.py
-```
-
-To submit **v1** instead, upload `submission_1.py` as your file or temporarily copy it to `submission.py`.
-
-## Short note to include in the notebook
 
 I documented my optimization process in this journal. I compared **submission_1** (backward with `probs.clone()`) and **submission_2** (no clone; subtract `grad_output` on `grad = probs * g` at target indices). **`submission.py` matches submission_2** for the default benchmark and server upload. Full timings and geomean speedups come from `test_cross_entropy.py` on GPU (Colab or A100).
