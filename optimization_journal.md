@@ -1,13 +1,11 @@
 # Cross-Entropy Speed Competition — Optimization Journal: Tharaka Fonseka (tf8712)
 
-## Official competition rules (Problem 2 Bonus — summary)
-
 - **Goal:** Fastest correct **forward + backward** cross-entropy in a **single Python file** with `cross_entropy_forward` and `cross_entropy_backward` only using **torch** and **triton** (and submodules).
 - **Hardware / problem size:** NVIDIA **A100 80GB**, `B = 4,096`, **bfloat16** logits, `reduction='none'`, **V ∈ {32,000, 50,264, 128,256}**.
 - **Correctness:** vs reference with **atol=1e-3**, **rtol=1e-2**.
 - **Environment:** PyTorch **2.11.0**, Triton **3.6.0**, CUDA **12.x**.
 - **Timing:** `torch.cuda.Event`, **median of 100** runs after warmup, **per V**. **Ranking uses geometric mean speedup** of **combined forward+backward** vs **PyTorch eager baseline** (the harness also prints separate fwd/bwd for analysis).
-- **Journal:** Required for bonus credit (**5 points** of the bonus are for a thoughtful write-up with genuine experimentation); top-20 speed is not required for partial journal credit.
+
 
 ## Final submission summary
 
