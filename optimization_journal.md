@@ -83,6 +83,7 @@ Markdown copy of the same numbers:
 ### Version 2 - Submission to Popcorn leaderboard 
 
 After Colab looked good with V_2, the **first** official **leaderboard** upload used **`submission.py`** (aligned with **v2** / `submission_2.py`). Popcorn reported:
+
 Note: From here onwards, every file submitted to leaderboard will be **`submission.py`* which will be identical to the version that is selected as the best version to be submitted. 
 
 | Field | Value |
