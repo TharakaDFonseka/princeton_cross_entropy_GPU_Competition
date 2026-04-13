@@ -78,11 +78,12 @@ Markdown copy of the same numbers:
 
 **Run-to-run variance:** A second immediate harness run on the same machine reported combined **1.640 / 2.691 / 7.565** ms with the same **3.31×** geomean (baseline and submission medians both jitter slightly; **V = 128k** combined time was stable to **~0.03%**).
 
-**Caveats:** Official grader lists **A100 80GB** and **PyTorch 2.11.0**; this machine is **40GB** and **2.10.x** — expect small shifts on the exact leaderboard stack. The **40GB vs 80GB** SKU does not change compute throughput for this problem size in a meaningful way; **Popcorn** is still the authoritative rank.
 
-### First Popcorn leaderboard submission (v2)
 
-After Colab looked good, the **first** official **leaderboard** upload used **`submission.py`** (aligned with **v2** / `submission_2.py`). Popcorn reported:
+### Version 2 - Submission to Popcorn leaderboard 
+
+After Colab looked good with V_2, the **first** official **leaderboard** upload used **`submission.py`** (aligned with **v2** / `submission_2.py`). Popcorn reported:
+Note: From here onwards, every file submitted to leaderboard will be **`submission.py`* which will be identical to the version that is selected as the best version to be submitted. 
 
 | Field | Value |
 |------|--------|
