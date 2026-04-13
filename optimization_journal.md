@@ -38,9 +38,33 @@ Target environment from the competition spec:
 
 **Colab measurement below:** GPU = whatever `torch.cuda.get_device_name(0)` prints (not the official **A100 80GB**). PyTorch version = `torch.__version__` on that runtime. Treat these as **development measurements**; for the write-up and leaderboard, prefer `python test_cross_entropy.py submission.py` on **A100** (**20** warmup, **100** runs per the provided script) or Popcorn output.
 
-### A100 harness run (`submission.py` = v2)
+### Version 1 — Google Colab
+
+**v1** (`submission_1.py`) on Colab (same runtime class as below: microbench / single-**V** focus at **V = 128,256**, **B = 4096**, median `torch.cuda.Event` ms):
+
+| Phase | Median time |
+|------|---:|
+| Forward | **1.7285** ms |
+| Backward | **6.3907** ms |
+| Forward + backward (sum) | **~8.12** ms |
+
+These are **not** the full three-**V** harness; they are useful for A/B vs v2 before running `test_cross_entropy.py` on all **V**.
+
+### Version 2 — Google Colab (`test_cross_entropy.py` harness)
 
 Recorded on **Google Colab**, **NVIDIA A100-SXM4-40GB**, **PyTorch 2.10.0+cu128**, using the course script (**20** warmup, **100** timed iterations, median ms). Correctness: **PASS** for all three **V** (max |fwd|/|bwd| error ≈ **1e−6** in the printed checks).
+
+Printed summary (same structure as the harness table):
+
+```
+        V |   Fwd ms   Bwd ms  Fwd+Bwd ms |     Fwd BW     Bwd BW  Fwd+Bwd BW |  Speedup
+  -----------------------------------------------------------------------------------------------
+    32000 |   0.354    1.323       1.599  |    740.0     396.3      491.7  |    3.56x
+    50264 |   0.603    2.231       2.756  |    682.8     369.1      448.3  |    3.31x
+   128256 |   1.367    6.296       7.563  |    768.6     333.8      416.8  |    3.07x
+```
+
+Markdown copy of the same numbers:
 
 | V | Fwd ms | Bwd ms | Fwd+Bwd ms | Fwd BW (GB/s) | Bwd BW (GB/s) | Fwd+Bwd BW (GB/s) | Speedup vs eager (combined) |
 |---:|---:|---:|---:|---:|---:|---:|---:|
@@ -53,6 +77,17 @@ Recorded on **Google Colab**, **NVIDIA A100-SXM4-40GB**, **PyTorch 2.10.0+cu128*
 **Run-to-run variance:** A second immediate harness run on the same machine reported combined **1.640 / 2.691 / 7.565** ms with the same **3.31×** geomean (baseline and submission medians both jitter slightly; **V = 128k** combined time was stable to **~0.03%**).
 
 **Caveats:** Official grader lists **A100 80GB** and **PyTorch 2.11.0**; this machine is **40GB** and **2.10.x** — expect small shifts on the exact leaderboard stack. The **40GB vs 80GB** SKU does not change compute throughput for this problem size in a meaningful way; **Popcorn** is still the authoritative rank.
+
+### First Popcorn leaderboard submission (v2)
+
+After Colab looked good, the **first** official **leaderboard** upload used **`submission.py`** (aligned with **v2** / `submission_2.py`). Popcorn reported:
+
+| Field | Value |
+|------|--------|
+| GitHub / display user | **TharakaDFonseka** |
+| Reported combined time | **2716.164 μs** (~**2.716 ms**) |
+
+That number is the grader’s own median over its **three vocabulary sizes** and environment (**A100**, PyTorch **2.11.0**, Triton **3.6.0**, CUDA **12.x**); it will not exactly match a single Colab row or the arithmetic sum of per-**V** “Fwd+Bwd ms” above. Use Popcorn for rank; use Colab + `test_cross_entropy.py` for iteration.
 
 ## Approaches I tried
 
@@ -129,7 +164,7 @@ Byte counts and bandwidth below match `test_cross_entropy.py`:
 |---|---:|---:|---:|---|
 | Eager baseline | — | — | — | From `test_cross_entropy.py` baseline block (reference for speedup). |
 | `torch.compile` forward only | — | — | — | Optional intermediate experiment. |
-| **submission_1** (clone in bwd) | **1.728512** | **6.390784** | **~8.119** | Older **Colab** microbench: **V = 128,256** only, **10** warmup / **50** iters (not the full harness). |
+| **submission_1** (clone in bwd) | **~1.7285** | **~6.3907** | **~8.12** | **Google Colab** microbench: **V = 128,256** only, **10** warmup / **50** iters (also printed as **1.728512** / **6.390784** ms in an earlier paste). |
 | **submission_2** / **`submission.py`** | (see per-**V** table above) | (see per-**V** table above) | **1.599 / 2.756 / 7.563** | **A100 40GB** full **`test_cross_entropy.py`** run; **geomean speedup ≈ 3.31×** (see variance note above). |
 
 For **competition-comparable** numbers, run **`python test_cross_entropy.py submission_1.py`** and **`submission_2.py`** (or `submission.py` for v2): **20** warmup, **100** runs, **three** **V** values, **geomean speedup** printed at the end.
@@ -143,7 +178,7 @@ The **submission_1** Colab timings below are only at **V = 128,256**, **B = 4096
 
 | Setting | Fwd GB/s | Bwd GB/s | Combined GB/s (sum of fwd + bwd medians) | Combined / 2039 peak |
 |---:|---:|---:|---:|---:|
-| **submission_1**, Colab, **V = 128,256**, fwd **1.728512** ms, bwd **6.390784** ms | **607.9** | **328.8** | **388.2** | **~19.0%** |
+| **submission_1**, Colab, **V = 128,256**, fwd **1.7285** ms, bwd **6.3907** ms (harness also printed **1.728512** / **6.390784**) | **607.9** | **328.8** | **388.2** | **~19.0%** |
 | **submission_2** (A100 40GB harness) | Use **Fwd+Bwd BW** from the main table: **492 / 448 / 417** GB/s at **V = 32k / 50k / 128k** | → combined / **2039** ≈ **24.1% / 22.0% / 20.4%** |
 
 **Peak A100 bandwidth (per assignment):** 2039 GB/s.
