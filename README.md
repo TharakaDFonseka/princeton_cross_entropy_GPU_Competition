@@ -1,6 +1,6 @@
 # Princeton COS484 — GPU Cross-Entropy Competition
 
-This repository contains work for the **optional GPU bonus** in Princeton’s **COS484 (NLP)** course: implement **forward and backward cross-entropy** as fast as possible on GPU. **Lower wall-clock time wins**; rankings are based on speedup over a fixed baseline, not raw loss values.
+This repository contains work for a competition for **COS484 (NLP)** course: implement **forward and backward cross-entropy** as fast as possible on GPU. **Lower wall-clock time wins**; rankings are based on speedup over a fixed baseline, not raw loss values.
 
 ## What you’re optimizing
 
