@@ -1,4 +1,4 @@
-# Cross-Entropy Speed Competition — Optimization Journal
+# Cross-Entropy Speed Competition — Optimization Journal: Tharaka Fonseka (tf8712)
 
 ## Official competition rules (Problem 2 Bonus — summary)
 
