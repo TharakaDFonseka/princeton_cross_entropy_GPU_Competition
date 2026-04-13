@@ -9,7 +9,7 @@
 
 ## Final submission summary
 
-Implementation uses `torch.compile(fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")` for forward and backward so TorchInductor can emit fused kernels.
+**Primary leaderboard implementation:** **`submission_4.py`** — custom **Triton** forward and backward (row-parallel, tiled over **V**). Earlier versions (**v1–v3**) use **`torch.compile`** + PyTorch for the hot path (**v2** was the best compile-only baseline before **v4**).
 
 **Files (versions + default upload name):**
 
@@ -17,8 +17,9 @@ Implementation uses `torch.compile(fullgraph=True, dynamic=False, mode="max-auto
 |------|------|
 | `submission_1.py` | **v1** — backward uses `probs.clone()` before subtracting 1 at the target index, then multiplies by `grad_output` (earlier baseline). |
 | `submission_2.py` | **v2** — backward uses `grad = probs * grad_output`, then `grad[rows, targets] -= grad_output` (same math, no extra full-matrix clone). |
-| `submission_3.py` | **v3** — experimental: “narrow” forward (stable log-sum-exp + `torch.gather` at `targets`; backward same compiled path as v2). Slower than v2 in Colab A/B; **not** the default submission. |
-| `submission.py` | **Same source as v2** — use this path for `test_cross_entropy.py` and for Popcorn upload unless you intentionally submit v1. |
+| `submission_3.py` | **v3** — experimental: “narrow” forward (stable log-sum-exp + `torch.gather` at `targets`; backward same compiled path as v2). Slower than v2 in Colab A/B; **not** used for rank. |
+| `submission_4.py` | **v4** — **Triton** CE forward + backward; **best Popcorn time** in this write-up (**1992.267 μs**). |
+| `submission.py` | **Copy of the version you submit** — for Popcorn, either upload **`submission_4.py`** directly or **`cp submission_4.py submission.py`** and submit **`submission.py`**. |
 
 ### submission_1 vs submission_2 (what changed)
 
@@ -115,11 +116,11 @@ Markdown copy of the same numbers:
 
 **Interpretation.** **v3 is slower overall** on this stack (**3.18×** vs **3.28×** geomean). Per **V**, **v3** is slightly **faster on forward at 32k** but **worse on forward at 50k and 128k**; backward is mixed but **combined Fwd+Bwd** loses at all three **V** vs **v2** in this run. Likely **TorchInductor** already lowers **`F.cross_entropy`** very well for **v2**, while **v3**’s graph (**gather** + explicit LSE) gets a **less favorable** fusion / kernel mix on the larger vocab sizes. **Decision:** keep **Popcorn / default `submission.py` aligned with v2**; treat **v3** as a documented negative result unless we revisit with **PyTorch 2.11** on the grader or a **custom Triton** forward/backward.
 
-### Version 2 - Submission to Popcorn leaderboard 
+### Version 2 — first Popcorn submission (compiled baseline)
 
-After Colab looked good with V_2, the **first** official **leaderboard** upload used **`submission.py`** (aligned with **v2** / `submission_2.py`). Popcorn reported:
+After Colab looked good with **v2**, the **first** official **leaderboard** upload used **`submission.py`** (aligned with **`submission_2.py`**). Popcorn reported:
 
-Note: From here onwards, every file submitted to leaderboard will be **`submission.py`** which will be identical to the version that is selected as the best version to be submitted. 
+Note: You can upload any **`submission_*.py`** filename to Popcorn, or copy the chosen file to **`submission.py`** for convenience. 
 
 | Field | Value |
 |------|--------|
@@ -127,6 +128,29 @@ Note: From here onwards, every file submitted to leaderboard will be **`submissi
 | Reported combined time | **2716.164 μs** (~**2.716 ms**) |
 
 That number is the grader’s own median over its **three vocabulary sizes** and environment (**A100**, PyTorch **2.11.0**, Triton **3.6.0**, CUDA **12.x**); it will not exactly match a single Colab row or the arithmetic sum of per-**V** “Fwd+Bwd ms” above. Use Popcorn for rank; use Colab + `test_cross_entropy.py` for iteration.
+
+### Version 4 — Custom Triton (`submission_4.py`) — motivation, design, results
+
+**Why move to Triton after v2/v3.** The problem is **memory-bandwidth heavy** (large **V**, read logits for softmax / CE, write **grad_logits**). **`torch.compile` + `F.cross_entropy` (v2)** already gets strong Inductor kernels, but the backward path can still split into **multiple launches** and extra traffic. **v3** (hand-written forward + `gather` under compile) was **slower** than v2 on Colab: Inductor did not reward that graph. The assignment explicitly allows **custom Triton kernels**, so the next step was to implement the **same math** as the reference in **explicit row-parallel kernels**: one program per batch row, **tiled** scans over **V**, minimizing reliance on the compiler to fuse a large PyTorch graph.
+
+**What was implemented.**
+
+- **`_ce_fwd_kernel`:** For each row, **two passes** over **V** in tiles of **`BLOCK_V`** (2048, or 4096 for large **V**): (1) **stable max**; (2) **sum of exp(x − m)** and **log** for log-sum-exp; then load **logits[row, target]** and set **loss = −(x\_y − m − LSE)** in **float32**. Targets are cast to **int32** in the Python wrapper (valid for **V ≤ 128256**).
+- **`_ce_bwd_kernel`:** Same row layout: recompute **m** and **LSE**, then one more tiled pass: **p = softmax**, **grad = p · g\_row**, subtract **g\_row** on the target column, store **bfloat16**.
+- **Implementation detail:** Triton **`@triton.jit`** cannot read arbitrary **module-level** Python globals; an early Colab run failed with **`NameError` on `_NEG`**. The fix was to use a **local literal** sentinel (**`-1.0e30`**) inside the kernel for masked max reductions instead of a global constant.
+
+**Colab (development).** On **Google Colab**, **A100-SXM4-40GB**, **PyTorch 2.10.0+cu128**, **`test_cross_entropy.py`** reported **PASS** all **V** and a much higher printed **geomean speedup** than v2 in the same session (e.g. **~4.50×** vs **~3.27×** for v2), with especially large gains on **backward** vs the compiled v2 graph. Those numbers are **not** the official grader stack but were strong evidence to try **Popcorn**.
+
+**Popcorn leaderboard (official).** Ranked submit of **`submission_4.py`**:
+
+| Field | Value |
+|------|--------|
+| User | **TharakaDFonseka** |
+| Reported combined time | **1992.267 μs** (~**1.992 ms**) |
+
+**Comparison to v2 on the same leaderboard metric:** **2716.164 μs → 1992.267 μs** → **~26.6%** lower time (**~1.36×** faster in wall-clock ratio **2716.164 / 1992.267**). This aligns with the qualitative Colab gap (Triton replacing many small backward kernels with one big row kernel per call direction).
+
+**Current choice for submission.** **v4 (`submission_4.py`)** is the **best measured** implementation here for **Popcorn**; keep **v2** as a **compile-only** reference and **v3** as a **negative** compile experiment in the write-up.
 
 ## Approaches I tried
 
@@ -154,7 +178,7 @@ That number is the grader’s own median over its **three vocabulary sizes** and
 
 ---
 
-### 3) `torch.compile` for both forward and backward (final)
+### 3) `torch.compile` for both forward and backward (**v2** — best compile-only baseline)
 **Idea:** Keep the forward as compiled cross-entropy, and write the backward directly with the stable softmax-gradient formula:
 \[
 \nabla_x \ell = (\mathrm{softmax}(x) - \mathrm{onehot}(y)) \cdot g
@@ -175,14 +199,20 @@ where `g = grad_output[:, None]`.
 
 ---
 
-### 4) Ideas I considered but did not fully pursue
-- Custom Triton forward kernel
-- Custom Triton backward kernel
-- Fused forward+backward in one custom kernel
-- Tuning Triton block sizes manually
-- More aggressive memory-layout tricks
+### 4) Custom Triton forward + backward (**submission_4** — **final for leaderboard**)
+**Idea:** Replace Inductor’s multi-kernel backward with **one Triton kernel per backward call** (and similarly for forward), row-parallel over **B**, tiled over **V**.
 
-**Why I did not use them in the final version:** They may be faster, but they require significantly more engineering/debugging effort and correctness validation. For this submission, I prioritized a strong, correct, and relatively compact implementation.
+**Why try it:** **v3** showed that another **`torch.compile`** graph is not guaranteed to beat **`F.cross_entropy`**. Triton lets us match the **reference math** while controlling **fusion** and **launch count** on a bandwidth-bound problem.
+
+**What happened:** **Correctness PASS** locally/Colab and on **Popcorn**; **leaderboard time improved** from **2716 μs (v2)** to **1992 μs (v4)**. See **Version 4** above for design and numbers.
+
+---
+
+### 5) Ideas not used (beyond v4)
+- Single fused kernel spanning both API calls (not exposed by the harness).
+- Exhaustive autotune grids on Popcorn (compile-time cost); **`BLOCK_V` / `num_warps`** are hand-picked.
+
+**Why v2–v3 stayed in the story:** They document the **compile path**; **v4** documents when **explicit kernels** win.
 
 ## Why the final version should be faster than eager
 
@@ -206,8 +236,9 @@ Byte counts and bandwidth below match `test_cross_entropy.py`:
 | **submission_1** (clone in bwd) | **~1.7285** | **~6.3907** | **~8.12** | **Google Colab** microbench: **V = 128,256** only, **10** warmup / **50** iters (also printed as **1.728512** / **6.390784** ms in an earlier paste). |
 | **submission_2** / **`submission.py`** | (see per-**V** table above) | (see per-**V** table above) | **1.599 / 2.756 / 7.563** | **A100 40GB** full **`test_cross_entropy.py`** run; **geomean speedup ≈ 3.31×** (see variance note above). |
 | **submission_3** (narrow fwd) | **0.383 / 0.714 / 1.599** | **1.368 / 2.232 / 6.294** | **1.683 / 2.867 / 7.806** | Same Colab **A100 40GB** session as **v2** row directly above in **Version 3**; **geomean speedup 3.18×** vs that run’s baseline (**slower than v2**). |
+| **submission_4** (Triton) | (see Colab log) | (see Colab log) | **~1.220 / 2.339 / 4.642** | Representative **A100 40GB** Colab harness run; **geomean speedup ~4.5×** vs eager in that session; **Popcorn combined 1992.267 μs** (official). |
 
-For **competition-comparable** numbers, run **`python test_cross_entropy.py submission_1.py`**, **`submission_2.py`**, and **`submission_3.py`** (or `submission.py` for v2): **20** warmup, **100** runs, **three** **V** values, **geomean speedup** printed at the end.
+For **competition-comparable** numbers, run **`python test_cross_entropy.py`** on each of **`submission_1.py` … `submission_4.py`**: **20** warmup, **100** runs, **three** **V** values, **geomean speedup** printed at the end.
 
 ## Achieved memory bandwidth
 
@@ -246,6 +277,7 @@ python test_cross_entropy.py submission.py
 python test_cross_entropy.py submission_1.py
 python test_cross_entropy.py submission_2.py
 python test_cross_entropy.py submission_3.py
+python test_cross_entropy.py submission_4.py
 ```
 
 Each run: correctness for all three **V**, timings, bandwidth, geomean speedup vs eager baseline.
@@ -254,7 +286,7 @@ Each run: correctness for all three **V**, timings, bandwidth, geomean speedup v
 
 1. **Runtime → Change runtime type → GPU** (T4/L4/A100 depending on tier).
 
-2. **Upload files** to `/content` (or use Drive): `submission.py`, `submission_1.py`, `submission_2.py`, `submission_3.py`, `test_cross_entropy.py`, and optionally `colab_benchmark_cross_entropy.py`.
+2. **Upload files** to `/content` (or use Drive): `submission.py`, `submission_1.py`–`submission_4.py`, `test_cross_entropy.py`, and optionally `colab_benchmark_cross_entropy.py`.
 
    ```python
    from google.colab import files
@@ -275,10 +307,11 @@ Each run: correctness for all three **V**, timings, bandwidth, geomean speedup v
    !python test_cross_entropy.py submission_1.py
    !python test_cross_entropy.py submission_2.py
    !python test_cross_entropy.py submission_3.py
+   !python test_cross_entropy.py submission_4.py
    !python test_cross_entropy.py submission.py
    ```
 
-   Or A/B **v2** vs **v3** in one go:
+   Or benchmark **v2 / v3 / v4** in one go:
 
    ```python
    !python colab_benchmark_cross_entropy.py
@@ -321,7 +354,7 @@ Each run: correctness for all three **V**, timings, bandwidth, geomean speedup v
            tb.append(e0.elapsed_time(e1))
        return statistics.median(tf), statistics.median(tb)
 
-   for name, path in [("v1", "/content/submission_1.py"), ("v2", "/content/submission_2.py"), ("v3", "/content/submission_3.py")]:
+   for name, path in [("v1", "/content/submission_1.py"), ("v2", "/content/submission_2.py"), ("v3", "/content/submission_3.py"), ("v4", "/content/submission_4.py")]:
        m = load(path)
        f, b = bench(m)
        print(name, "forward ms:", f, "backward ms:", b, "sum:", f + b)
@@ -356,17 +389,17 @@ wget https://raw.githubusercontent.com/gpu-mode/reference-kernels/main/problems/
 5. Run a correctness check:
 
 ```bash
-popcorn submit --leaderboard princeton_cross_entropy --gpu A100 --mode test submission.py
+popcorn submit --leaderboard princeton_cross_entropy --gpu A100 --mode test submission_4.py
 ```
 
-6. Submit an official ranked run (uses **`submission.py`** — currently aligned with **submission_2**):
+6. Submit an official ranked run (**best result in this journal: `submission_4.py`**):
 
 ```bash
-popcorn submit --leaderboard princeton_cross_entropy --gpu A100 --mode leaderboard submission.py
+popcorn submit --leaderboard princeton_cross_entropy --gpu A100 --mode leaderboard submission_4.py
 ```
 
-To submit **v1** instead, upload `submission_1.py` as your file or temporarily copy it to `submission.py`.
+Alternatively: `cp submission_4.py submission.py` and submit **`submission.py`**. To submit an older version, point the command at **`submission_2.py`**, etc.
 
 ## Short note to include in the notebook
 
-I documented my optimization process in this journal. I compared **submission_1** (backward with `probs.clone()`) and **submission_2** (no clone; subtract `grad_output` on `grad = probs * g` at target indices). I also tried **submission_3** (narrow forward with log-sum-exp + `gather`, same backward as v2); it **passed** correctness but was **slower** than v2 in a same-session Colab A/B (**geomean 3.18×** vs **3.28×**). **`submission.py` matches submission_2** for the default benchmark and server upload. Full timings and geomean speedups come from `test_cross_entropy.py` on GPU (Colab or A100).
+I documented my optimization process in this journal. I compared **submission_1** and **submission_2** (`torch.compile` + stable backward without `probs.clone()`). **submission_3** (narrow forward + `gather` under compile) **passed** correctness but was **slower** than v2 in Colab (see **Version 3**). **submission_4** implements **forward and backward in Triton** (row-parallel, tiled **V**), fixes the **`_NEG` global / Triton JIT** issue with a local sentinel, and **improved the Popcorn leaderboard** from **2716.164 μs (v2)** to **1992.267 μs**. For upload, use **`submission_4.py`** (or copy to **`submission.py`**) with **`popcorn submit … --mode leaderboard`**. Local/Colab numbers use **`test_cross_entropy.py`**; the grader uses **PyTorch 2.11** and **Triton 3.6** on **A100 80GB**.
