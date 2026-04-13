@@ -106,7 +106,7 @@ That number is the grader’s own median over its **three vocabulary sizes** and
 
 ---
 
-### 2) `torch.compile` around the forward only
+### 2) `torch.compile` around the forward only [Mention the assignment]
 **Idea:** Compile only the forward `F.cross_entropy(..., reduction="none")`.
 
 **Why try it:** The official `torch.compile` docs explain that it can lower Python/PyTorch code to optimized kernels, often with fusion. See the official docs:
