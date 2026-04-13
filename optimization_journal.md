@@ -41,6 +41,7 @@ Target environment from the competition spec:
 ### Version 1 — Google Colab
 
 **Initial Version**.
+
 **v1** (`submission_1.py`) was run on Colab (same runtime class as below: microbench / single-**V** focus at **V = 128,256**, **B = 4096**, median `torch.cuda.Event` ms):
 
 | Phase | Median time |
