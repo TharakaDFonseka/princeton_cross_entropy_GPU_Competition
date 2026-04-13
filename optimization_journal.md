@@ -11,12 +11,13 @@
 
 Implementation uses `torch.compile(fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")` for forward and backward so TorchInductor can emit fused kernels.
 
-**Files (two versions + default upload name):**
+**Files (versions + default upload name):**
 
 | File | Role |
 |------|------|
 | `submission_1.py` | **v1** — backward uses `probs.clone()` before subtracting 1 at the target index, then multiplies by `grad_output` (earlier baseline). |
 | `submission_2.py` | **v2** — backward uses `grad = probs * grad_output`, then `grad[rows, targets] -= grad_output` (same math, no extra full-matrix clone). |
+| `submission_3.py` | **v3** — experimental: “narrow” forward (stable log-sum-exp + `torch.gather` at `targets`; backward same compiled path as v2). Slower than v2 in Colab A/B; **not** the default submission. |
 | `submission.py` | **Same source as v2** — use this path for `test_cross_entropy.py` and for Popcorn upload unless you intentionally submit v1. |
 
 ### submission_1 vs submission_2 (what changed)
@@ -78,7 +79,41 @@ Markdown copy of the same numbers:
 
 **Run-to-run variance:** A second immediate harness run on the same machine reported combined **1.640 / 2.691 / 7.565** ms with the same **3.31×** geomean (baseline and submission medians both jitter slightly; **V = 128k** combined time was stable to **~0.03%**).
 
+**Caveats:** Official grader lists **A100 80GB** and **PyTorch 2.11.0**; this machine is **40GB** and **2.10.x** — expect small shifts on the exact leaderboard stack. The **40GB vs 80GB** SKU does not change compute throughput for this problem size in a meaningful way; **Popcorn** is still the authoritative rank.
 
+### Version 3 — “narrow” forward experiment (`submission_3.py`)
+
+**Motivation (why try this).** Cross-entropy with `reduction='none'` only needs **one scalar loss per row**. The **v2** forward uses `F.cross_entropy` inside `@torch.compile`, which is correct and fast, but we hypothesized that a **hand-written forward** might avoid extra work or extra global traffic: stable **row-wise max**, **log-sum-exp** over the row, then **gather** the target logit with `torch.gather` and form \(\ell_i = -(x_{i,y_i} - m_i - \mathrm{LSE}_i)\). That path still reads the full logits row for the **sum of exponentials** (same asymptotic reads as softmax normalization) but **does not need to materialize a full `(B, V)` softmax tensor for the forward return value**—only the backward still builds probabilities the usual way. Under **memory-bound** assumptions, that sometimes helps; we also wanted a **rules-legal** experiment before investing in a full **Triton** kernel.
+
+**What we implemented.** New file **`submission_3.py`**: `torch.compile(fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs")` on (1) **`_compiled_forward`**: `logits.float()` → row `max` → `exp`/`sum`/`log` for LSE → `torch.gather` for \(x_{i,y_i}\) → **float32** losses; (2) **`_compiled_backward`**: **identical** to **v2** (softmax from logits, `grad = probs * grad_output[:, None]`, subtract `grad_output` at targets, **bf16** out). A small helper script **`colab_benchmark_cross_entropy.py`** was added to run **`test_cross_entropy.py`** on **v2** then **v3** in subprocesses (avoids a Colab **`TORCH_LOGS`** / `import torch` crash in the parent process).
+
+**What happened — correctness.** Full harness **PASS** all **V** (same tiny errors as v2, ≈**1e−6** on printed checks).
+
+**What happened — performance (same Colab session, direct A/B).** **Google Colab**, **NVIDIA A100-SXM4-40GB**, **PyTorch 2.10.0+cu128**, course script (**20** warmup, **100** timed iters). Baseline jitter differs slightly between the two runs below because each harness invocation re-benchmarks eager baseline; focus on **submission** columns and **geomean speedup** printed for each file.
+
+**v2 (`submission_2.py`) in that session:**
+
+```
+        V |   Fwd ms   Bwd ms  Fwd+Bwd ms |     Fwd BW     Bwd BW  Fwd+Bwd BW |  Speedup
+    32000 |   0.410    1.308       1.634  |    639.3     401.0      481.3  |    3.49x
+    50264 |   0.610    2.245       2.768  |    674.8     366.8      446.3  |    3.30x
+   128256 |   1.396    6.304       7.598  |    752.8     333.4      414.9  |    3.06x
+```
+
+**Competition-style geomean speedup (printed):** **3.28×**.
+
+**v3 (`submission_3.py`) in the same environment:**
+
+```
+        V |   Fwd ms   Bwd ms  Fwd+Bwd ms |     Fwd BW     Bwd BW  Fwd+Bwd BW |  Speedup
+    32000 |   0.383    1.368       1.683  |    684.6     383.3      467.2  |    3.39x
+    50264 |   0.714    2.232       2.867  |    576.6     368.9      430.9  |    3.18x
+   128256 |   1.599    6.294       7.806  |    656.9     333.9      403.8  |    2.98x
+```
+
+**Competition-style geomean speedup (printed):** **3.18×**.
+
+**Interpretation.** **v3 is slower overall** on this stack (**3.18×** vs **3.28×** geomean). Per **V**, **v3** is slightly **faster on forward at 32k** but **worse on forward at 50k and 128k**; backward is mixed but **combined Fwd+Bwd** loses at all three **V** vs **v2** in this run. Likely **TorchInductor** already lowers **`F.cross_entropy`** very well for **v2**, while **v3**’s graph (**gather** + explicit LSE) gets a **less favorable** fusion / kernel mix on the larger vocab sizes. **Decision:** keep **Popcorn / default `submission.py` aligned with v2**; treat **v3** as a documented negative result unless we revisit with **PyTorch 2.11** on the grader or a **custom Triton** forward/backward.
 
 ### Version 2 - Submission to Popcorn leaderboard 
 
@@ -170,8 +205,9 @@ Byte counts and bandwidth below match `test_cross_entropy.py`:
 | `torch.compile` forward only | — | — | — | Optional intermediate experiment. |
 | **submission_1** (clone in bwd) | **~1.7285** | **~6.3907** | **~8.12** | **Google Colab** microbench: **V = 128,256** only, **10** warmup / **50** iters (also printed as **1.728512** / **6.390784** ms in an earlier paste). |
 | **submission_2** / **`submission.py`** | (see per-**V** table above) | (see per-**V** table above) | **1.599 / 2.756 / 7.563** | **A100 40GB** full **`test_cross_entropy.py`** run; **geomean speedup ≈ 3.31×** (see variance note above). |
+| **submission_3** (narrow fwd) | **0.383 / 0.714 / 1.599** | **1.368 / 2.232 / 6.294** | **1.683 / 2.867 / 7.806** | Same Colab **A100 40GB** session as **v2** row directly above in **Version 3**; **geomean speedup 3.18×** vs that run’s baseline (**slower than v2**). |
 
-For **competition-comparable** numbers, run **`python test_cross_entropy.py submission_1.py`** and **`submission_2.py`** (or `submission.py` for v2): **20** warmup, **100** runs, **three** **V** values, **geomean speedup** printed at the end.
+For **competition-comparable** numbers, run **`python test_cross_entropy.py submission_1.py`**, **`submission_2.py`**, and **`submission_3.py`** (or `submission.py` for v2): **20** warmup, **100** runs, **three** **V** values, **geomean speedup** printed at the end.
 
 ## Achieved memory bandwidth
 
@@ -209,6 +245,7 @@ Even a very good implementation usually will not reach 100% of peak A100 bandwid
 python test_cross_entropy.py submission.py
 python test_cross_entropy.py submission_1.py
 python test_cross_entropy.py submission_2.py
+python test_cross_entropy.py submission_3.py
 ```
 
 Each run: correctness for all three **V**, timings, bandwidth, geomean speedup vs eager baseline.
@@ -217,11 +254,11 @@ Each run: correctness for all three **V**, timings, bandwidth, geomean speedup v
 
 1. **Runtime → Change runtime type → GPU** (T4/L4/A100 depending on tier).
 
-2. **Upload files** to `/content` (or use Drive): `submission.py`, `submission_1.py`, `submission_2.py`, `test_cross_entropy.py`.
+2. **Upload files** to `/content` (or use Drive): `submission.py`, `submission_1.py`, `submission_2.py`, `submission_3.py`, `test_cross_entropy.py`, and optionally `colab_benchmark_cross_entropy.py`.
 
    ```python
    from google.colab import files
-   files.upload()   # select all four .py files
+   files.upload()   # select the .py files you need
    ```
 
 3. **Check GPU and PyTorch** (optional):
@@ -231,26 +268,25 @@ Each run: correctness for all three **V**, timings, bandwidth, geomean speedup v
    print(torch.__version__, torch.cuda.get_device_name(0))
    ```
 
-4. **Official harness (recommended)** — matches course script (**20** warmup, **100** iters). **Silence TorchInductor log spam** (otherwise you may see huge `torch/_inductor/graph.py` / `__output_code` dumps):
+4. **Official harness (recommended)** — matches course script (**20** warmup, **100** iters). Do **not** set `TORCH_LOGS` to empty on some Colab builds (can break `import torch`); run benchmarks in a **fresh** `!python ...` process, or use **`colab_benchmark_cross_entropy.py`** (subprocesses strip `TORCH_LOGS`).
 
    ```python
    %cd /content
-   %env TORCH_LOGS=
    !python test_cross_entropy.py submission_1.py
    !python test_cross_entropy.py submission_2.py
+   !python test_cross_entropy.py submission_3.py
    !python test_cross_entropy.py submission.py
    ```
 
-   If logs still appear, set the env **before** importing PyTorch in any earlier cell, e.g.:
+   Or A/B **v2** vs **v3** in one go:
 
    ```python
-   import os
-   os.environ["TORCH_LOGS"] = ""
-   os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/tmp/torchinductor_colab"  # optional: fixed cache dir
+   !python colab_benchmark_cross_entropy.py
    ```
 
-   Then restart the runtime or run the benchmark in a fresh process via `!python ...` only.
+   Optional: `TORCHINDUCTOR_CACHE_DIR` in the environment **before** importing torch if you want a fixed Inductor cache dir.
 
+   Copy the full printed table and **geomean speedup** into this journal.
 
 5. **Optional quick microbench** (single **V**, e.g. 128256 — good for A/B, not a substitute for step 4):
 
@@ -285,12 +321,52 @@ Each run: correctness for all three **V**, timings, bandwidth, geomean speedup v
            tb.append(e0.elapsed_time(e1))
        return statistics.median(tf), statistics.median(tb)
 
-   for name, path in [("v1", "/content/submission_1.py"), ("v2", "/content/submission_2.py")]:
+   for name, path in [("v1", "/content/submission_1.py"), ("v2", "/content/submission_2.py"), ("v3", "/content/submission_3.py")]:
        m = load(path)
        f, b = bench(m)
        print(name, "forward ms:", f, "backward ms:", b, "sum:", f + b)
    ```
 
+## How to submit
 
+1. Install the CLI:
 
-I documented my optimization process in this journal. I compared **submission_1** (backward with `probs.clone()`) and **submission_2** (no clone; subtract `grad_output` on `grad = probs * g` at target indices). **`submission.py` matches submission_2** for the default benchmark and server upload. Full timings and geomean speedups come from `test_cross_entropy.py` on GPU (Colab or A100).
+```bash
+curl -fsSL https://raw.githubusercontent.com/gpu-mode/popcorn-cli/main/install.sh | bash
+```
+
+2. Register once with GitHub:
+
+```bash
+popcorn register github
+```
+
+3. Join the leaderboard with your invite code:
+
+```bash
+popcorn join <YOUR_INVITE_CODE>
+```
+
+4. Get the starter file if needed:
+
+```bash
+wget https://raw.githubusercontent.com/gpu-mode/reference-kernels/main/problems/princeton/cross_entropy_py/submission.py
+```
+
+5. Run a correctness check:
+
+```bash
+popcorn submit --leaderboard princeton_cross_entropy --gpu A100 --mode test submission.py
+```
+
+6. Submit an official ranked run (uses **`submission.py`** — currently aligned with **submission_2**):
+
+```bash
+popcorn submit --leaderboard princeton_cross_entropy --gpu A100 --mode leaderboard submission.py
+```
+
+To submit **v1** instead, upload `submission_1.py` as your file or temporarily copy it to `submission.py`.
+
+## Short note to include in the notebook
+
+I documented my optimization process in this journal. I compared **submission_1** (backward with `probs.clone()`) and **submission_2** (no clone; subtract `grad_output` on `grad = probs * g` at target indices). I also tried **submission_3** (narrow forward with log-sum-exp + `gather`, same backward as v2); it **passed** correctness but was **slower** than v2 in a same-session Colab A/B (**geomean 3.18×** vs **3.28×**). **`submission.py` matches submission_2** for the default benchmark and server upload. Full timings and geomean speedups come from `test_cross_entropy.py` on GPU (Colab or A100).
