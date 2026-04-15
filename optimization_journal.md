@@ -9,7 +9,7 @@
 
 ## Final submission summary
 
-**Primary leaderboard implementation:** **`submission_4.py`** — custom **Triton** forward and backward (row-parallel, tiled over **V**). Earlier versions (**v1–v3**) use **`torch.compile`** + PyTorch for the hot path (**v2** was the best compile-only baseline before **v4**).
+**Primary leaderboard implementation:** **`submission_5.py`** — same **Triton** row-parallel design as **v4**, but with **online softmax** (fused row **max** + **sum exp** in **one** pass over **V**) to cut redundant global reads; **backward** uses the same fused reduction then one gradient pass (**two** logits sweeps vs **v4**’s **three**). Earlier versions (**v1–v3**) use **`torch.compile`**; **v4** was the first full-Triton baseline on Popcorn (**1992.267 μs**).
 
 **Files (versions + default upload name):**
 
@@ -18,8 +18,9 @@
 | `submission_1.py` | **v1** — backward uses `probs.clone()` before subtracting 1 at the target index, then multiplies by `grad_output` (earlier baseline). |
 | `submission_2.py` | **v2** — backward uses `grad = probs * grad_output`, then `grad[rows, targets] -= grad_output` (same math, no extra full-matrix clone). |
 | `submission_3.py` | **v3** — experimental: “narrow” forward (stable log-sum-exp + `torch.gather` at `targets`; backward same compiled path as v2). Slower than v2 in Colab A/B; **not** used for rank. |
-| `submission_4.py` | **v4** — **Triton** CE forward + backward; **best Popcorn time** in this write-up (**1992.267 μs**). |
-| `submission.py` | **Copy of the version you submit** — for Popcorn, either upload **`submission_4.py`** directly or **`cp submission_4.py submission.py`** and submit **`submission.py`**. |
+| `submission_4.py` | **v4** — **Triton** CE forward + backward (separate max pass, then sum-exp pass, then grad pass on backward); Popcorn **1992.267 μs** (superseded by **v5**). |
+| `submission_5.py` | **v5** — **Triton** with **online** max + LSE in one tiled sweep (fwd + bwd reduction); **best Popcorn time** here (**1270.465 μs**). |
+| `submission.py` | **Copy of the version you submit** — for Popcorn: **`cp submission_5.py submission.py`** (or upload **`submission_5.py`** if the CLI accepts it) and run **`popcorn submit … submission.py`**. |
 
 ### submission_1 vs submission_2 (what changed)
 
@@ -150,7 +151,37 @@ That number is the grader’s own median over its **three vocabulary sizes** and
 
 **Comparison to v2 on the same leaderboard metric:** **2716.164 μs → 1992.267 μs** → **~26.6%** lower time (**~1.36×** faster in wall-clock ratio **2716.164 / 1992.267**). This aligns with the qualitative Colab gap (Triton replacing many small backward kernels with one big row kernel per call direction).
 
-**Current choice for submission.** **v4 (`submission_4.py`)** is the **best measured** implementation here for **Popcorn**; keep **v2** as a **compile-only** reference and **v3** as a **negative** compile experiment in the write-up.
+**Later improvement — see Version 5.** **v5** further reduces Popcorn time to **1270.465 μs**; **v4** remains the clean baseline for “first custom Triton” vs **v5**’s fused reduction.
+
+### Version 5 — Online softmax / LSE (`submission_5.py`) — why, inspiration, results
+
+**Why do this after v4.** **v4** already uses **one kernel per forward** and **one per backward**, but the math is implemented with **extra passes over each row’s logits**:
+- **Forward:** full sweep for **row max `m`**, then a **second** sweep for **Σ exp(x − m)** (then target logit + loss).
+- **Backward:** **three** sweeps — **max**, **sum exp** (to get **LSE** / normalization), then **softmax gradient**.
+
+For large **V**, the kernel is **memory-bound**; every **extra** full read of the **bf16** row is expensive. The goal was to **remove one full read pass on the backward path** and **merge max + sum-exp on the forward path** without changing numerics (still stable softmax / cross-entropy in **float32** inside the kernel).
+
+**Inspiration.** The standard **online softmax** trick (maintain running **max** and a running **sum of exponentials** rescaled when the max increases) is how fused softmax tutorials avoid multiple full passes over the row. The Triton community material on **fused softmax** describes combining max and sum in one streaming reduction; see the [Triton fused softmax tutorial](https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html) and [tutorial source](https://github.com/triton-lang/triton/blob/main/python/tutorials/02-fused-softmax.py). **v5** applies the same **idea** to our row-wise CE: in each tile, update **`m_new = max(m, tile_max)`** and **`s = s * exp(m - m_new) + sum(exp(x - m_new))`**, then **`lse = log(s)`**; backward repeats that fused reduction, then one pass for **`p = exp(x - m - lse)`** and **`grad`**.
+
+**What was implemented (summary).** New file **`submission_5.py`**: same API as **v4** (`cross_entropy_forward` / `cross_entropy_backward`), same **`BLOCK_V` / `num_warps`** launch pattern, literals-only inside **`@triton.jit`**. **Forward:** one tiled loop for **(m, s)** → **`lse`**, then target load and loss. **Backward:** one tiled loop for **(m, s)** → **`lse`**, then one tiled loop for **grad** (same math as **v4**).
+
+**Correctness.** **`test_cross_entropy.py`** on Colab (**A100 40GB**, **PyTorch 2.10.0+cu128**): **PASS** all **V** (errors on the order of **1e−6** fwd / **1e−6–1e−5** bwd in a representative run — within harness tolerances).
+
+**Colab (development).** Same harness reported a high **geomean speedup vs eager** (e.g. **~6.7×** in one session); as always, that number is **relative to that machine’s eager baseline**, not a direct map to Popcorn **μs**.
+
+**Popcorn leaderboard (official).** Ranked submit of **`submission_5.py`** (or **`submission.py`** copied from it):
+
+| Field | Value |
+|------|--------|
+| User | **TharakaDFonseka** |
+| Reported combined time | **1270.465 μs** (~**1.270 ms**) |
+
+**Comparison on the same leaderboard metric:**
+- **v2 → v4:** **2716.164 → 1992.267 μs** (**~1.36×** faster than v2).
+- **v4 → v5:** **1992.267 → 1270.465 μs** (**~1.57×** faster than v4; combined time **~36%** lower).
+- **v2 → v5:** **2716.164 / 1270.465 ≈ 2.14×** faster than the original compiled Popcorn submit.
+
+**Current choice for submission.** **v5 (`submission_5.py`)** is the **best measured** implementation here for **Popcorn**. Keep **v4** to document the **first** Triton port; **v5** documents **fused reduction** as the next win on bandwidth-bound CE.
 
 ## Approaches I tried
 
@@ -199,7 +230,7 @@ where `g = grad_output[:, None]`.
 
 ---
 
-### 4) Custom Triton forward + backward (**submission_4** — **final for leaderboard**)
+### 4) Custom Triton forward + backward (**submission_4** — first full-Triton Popcorn baseline)
 **Idea:** Replace Inductor’s multi-kernel backward with **one Triton kernel per backward call** (and similarly for forward), row-parallel over **B**, tiled over **V**.
 
 **Why try it:** **v3** showed that another **`torch.compile`** graph is not guaranteed to beat **`F.cross_entropy`**. Triton lets us match the **reference math** while controlling **fusion** and **launch count** on a bandwidth-bound problem.
@@ -208,15 +239,24 @@ where `g = grad_output[:, None]`.
 
 ---
 
-### 5) Ideas not used (beyond v4)
+### 5) Triton + **online** max / LSE (**submission_5** — **current best for leaderboard**)
+**Idea:** Keep **v4**’s structure (row-parallel, tiled **V**, bf16 in / bf16 grad out, float32 softmax math), but fuse **row max** and **Σ exp(x − m)** into **one** pass over logits (online softmax reduction), and use the same fused reduction on the backward so the backward path needs **two** full reads of the row instead of **three**.
+
+**Why try it:** **v4** already wins vs compile by launch count, but still **re-reads** the full row for separate max and sum phases. On an **HBM-limited** kernel, **one fewer pass** is a direct lever; the fused softmax literature is the template.
+
+**What happened:** **PASS** on **`test_cross_entropy.py`**; Popcorn **1992.267 μs (v4) → 1270.465 μs (v5)**. See **Version 5** above.
+
+---
+
+### 6) Ideas not used (beyond v5)
 - Single fused kernel spanning both API calls (not exposed by the harness).
 - Exhaustive autotune grids on Popcorn (compile-time cost); **`BLOCK_V` / `num_warps`** are hand-picked.
 
-**Why v2–v3 stayed in the story:** They document the **compile path**; **v4** documents when **explicit kernels** win.
+**Why v2–v3 stayed in the story:** They document the **compile path**; **v4–v5** document when **explicit kernels** and then **fused reductions** win.
 
 ## Why the final version should be faster than eager
 
-Cross-entropy is mainly **memory-bound**, so reducing HBM traffic matters more than increasing raw FLOPs. That means fusion is important.
+Cross-entropy is mainly **memory-bound**, so reducing HBM traffic matters more than increasing raw FLOPs. That means fusion is important. **v5** goes one step further than **v4** by fusing the **row max** and **exponential sum** into **one** sweep (and saving a full backward pass), which directly targets global-memory traffic on each row.
 
 Relevant references:
 - Triton fused softmax tutorial: https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html
@@ -237,8 +277,9 @@ Byte counts and bandwidth below match `test_cross_entropy.py`:
 | **submission_2** / **`submission.py`** | (see per-**V** table above) | (see per-**V** table above) | **1.599 / 2.756 / 7.563** | **A100 40GB** full **`test_cross_entropy.py`** run; **geomean speedup ≈ 3.31×** (see variance note above). |
 | **submission_3** (narrow fwd) | **0.383 / 0.714 / 1.599** | **1.368 / 2.232 / 6.294** | **1.683 / 2.867 / 7.806** | Same Colab **A100 40GB** session as **v2** row directly above in **Version 3**; **geomean speedup 3.18×** vs that run’s baseline (**slower than v2**). |
 | **submission_4** (Triton) | (see Colab log) | (see Colab log) | **~1.220 / 2.339 / 4.642** | Representative **A100 40GB** Colab harness run; **geomean speedup ~4.5×** vs eager in that session; **Popcorn combined 1992.267 μs** (official). |
+| **submission_5** (Triton + online LSE) | (Colab harness) | (Colab harness) | (per-**V** from latest run) | **Popcorn combined 1270.465 μs** (official); **~6.7×** geomean speedup vs eager reported in one Colab session (baseline-relative). |
 
-For **competition-comparable** numbers, run **`python test_cross_entropy.py`** on each of **`submission_1.py` … `submission_4.py`**: **20** warmup, **100** runs, **three** **V** values, **geomean speedup** printed at the end.
+For **competition-comparable** numbers, run **`python test_cross_entropy.py`** on each of **`submission_1.py` … `submission_5.py`**: **20** warmup, **100** runs, **three** **V** values, **geomean speedup** printed at the end.
 
 ## Achieved memory bandwidth
 
@@ -278,6 +319,7 @@ python test_cross_entropy.py submission_1.py
 python test_cross_entropy.py submission_2.py
 python test_cross_entropy.py submission_3.py
 python test_cross_entropy.py submission_4.py
+python test_cross_entropy.py submission_5.py
 ```
 
 Each run: correctness for all three **V**, timings, bandwidth, geomean speedup vs eager baseline.
@@ -286,7 +328,7 @@ Each run: correctness for all three **V**, timings, bandwidth, geomean speedup v
 
 1. **Runtime → Change runtime type → GPU** (T4/L4/A100 depending on tier).
 
-2. **Upload files** to `/content` (or use Drive): `submission.py`, `submission_1.py`–`submission_4.py`, `test_cross_entropy.py`, and optionally `colab_benchmark_cross_entropy.py`.
+2. **Upload files** to `/content` (or use Drive): `submission.py`, `submission_1.py`–`submission_5.py`, `test_cross_entropy.py`, and optionally `colab_benchmark_cross_entropy.py`.
 
    ```python
    from google.colab import files
@@ -308,10 +350,11 @@ Each run: correctness for all three **V**, timings, bandwidth, geomean speedup v
    !python test_cross_entropy.py submission_2.py
    !python test_cross_entropy.py submission_3.py
    !python test_cross_entropy.py submission_4.py
+   !python test_cross_entropy.py submission_5.py
    !python test_cross_entropy.py submission.py
    ```
 
-   Or benchmark **v2 / v3 / v4** in one go:
+   Or benchmark **v2 / v3 / v4 / v5** in one go:
 
    ```python
    !python colab_benchmark_cross_entropy.py
@@ -354,7 +397,7 @@ Each run: correctness for all three **V**, timings, bandwidth, geomean speedup v
            tb.append(e0.elapsed_time(e1))
        return statistics.median(tf), statistics.median(tb)
 
-   for name, path in [("v1", "/content/submission_1.py"), ("v2", "/content/submission_2.py"), ("v3", "/content/submission_3.py"), ("v4", "/content/submission_4.py")]:
+   for name, path in [("v1", "/content/submission_1.py"), ("v2", "/content/submission_2.py"), ("v3", "/content/submission_3.py"), ("v4", "/content/submission_4.py"), ("v5", "/content/submission_5.py")]:
        m = load(path)
        f, b = bench(m)
        print(name, "forward ms:", f, "backward ms:", b, "sum:", f + b)
@@ -389,17 +432,17 @@ wget https://raw.githubusercontent.com/gpu-mode/reference-kernels/main/problems/
 5. Run a correctness check:
 
 ```bash
-popcorn submit --leaderboard princeton_cross_entropy --gpu A100 --mode test submission_4.py
+popcorn submit --leaderboard princeton_cross_entropy --gpu A100 --mode test submission_5.py
 ```
 
-6. Submit an official ranked run (**best result in this journal: `submission_4.py`**):
+6. Submit an official ranked run (**best result in this journal: `submission_5.py`**):
 
 ```bash
-popcorn submit --leaderboard princeton_cross_entropy --gpu A100 --mode leaderboard submission_4.py
+popcorn submit --leaderboard princeton_cross_entropy --gpu A100 --mode leaderboard submission_5.py
 ```
 
-Alternatively: `cp submission_4.py submission.py` and submit **`submission.py`**. To submit an older version, point the command at **`submission_2.py`**, etc.
+Alternatively: `cp submission_5.py submission.py` and submit **`submission.py`**. To submit an older version, point the command at **`submission_4.py`**, **`submission_2.py`**, etc.
 
 ## Short note to include in the notebook
 
-I documented my optimization process in this journal. I compared **submission_1** and **submission_2** (`torch.compile` + stable backward without `probs.clone()`). **submission_3** (narrow forward + `gather` under compile) **passed** correctness but was **slower** than v2 in Colab (see **Version 3**). **submission_4** implements **forward and backward in Triton** (row-parallel, tiled **V**), fixes the **`_NEG` global / Triton JIT** issue with a local sentinel, and **improved the Popcorn leaderboard** from **2716.164 μs (v2)** to **1992.267 μs**. For upload, use **`submission_4.py`** (or copy to **`submission.py`**) with **`popcorn submit … --mode leaderboard`**. Local/Colab numbers use **`test_cross_entropy.py`**; the grader uses **PyTorch 2.11** and **Triton 3.6** on **A100 80GB**.
+I documented my optimization process in this journal. I compared **submission_1** and **submission_2** (`torch.compile` + stable backward without `probs.clone()`). **submission_3** (narrow forward + `gather` under compile) **passed** correctness but was **slower** than v2 in Colab (see **Version 3**). **submission_4** implements **forward and backward in Triton** (row-parallel, tiled **V**), fixes the **`_NEG` global / Triton JIT** issue with a local sentinel, and **improved Popcorn** from **2716.164 μs (v2)** to **1992.267 μs**. **submission_5** applies an **online softmax**-style fused reduction (**one** pass for row max + sum of exponentials on forward; **two** logits passes on backward instead of **v4**’s **three**), inspired by the **Triton fused softmax** tutorial, and reached **1270.465 μs** on Popcorn. For upload, use **`submission_5.py`** (or **`cp submission_5.py submission.py`**) with **`popcorn submit … --mode leaderboard`**. Local/Colab numbers use **`test_cross_entropy.py`**; the grader uses **PyTorch 2.11** and **Triton 3.6** on **A100 80GB**.
