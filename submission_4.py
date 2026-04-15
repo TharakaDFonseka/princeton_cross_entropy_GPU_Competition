@@ -14,8 +14,7 @@ import torch
 import triton
 import triton.language as tl
 
-# Finite sentinel for masked max (avoids -inf edge cases in reductions)
-_NEG = -1.0e30
+# Note: @triton.jit kernels cannot read module-level variables (use literals or tl.constexpr).
 
 
 @triton.jit
@@ -31,17 +30,18 @@ def _ce_fwd_kernel(
     row = tl.program_id(0)
     base = row * stride_l0
 
-    m = _NEG
+    neg_big = -1.0e30  # masked-max sentinel (literal; no global in @jit)
+    m = neg_big
     for start in range(0, V, BLOCK_V):
         offs = start + tl.arange(0, BLOCK_V)
         mask = offs < V
         x = tl.load(
             logits_ptr + base + offs * stride_l1,
             mask=mask,
-            other=_NEG,
+            other=neg_big,
         )
         x = x.to(tl.float32)
-        m = tl.maximum(m, tl.max(tl.where(mask, x, _NEG)))
+        m = tl.maximum(m, tl.max(tl.where(mask, x, neg_big)))
 
     acc = 0.0
     for start in range(0, V, BLOCK_V):
@@ -81,17 +81,18 @@ def _ce_bwd_kernel(
     base_g = row * stride_g0
     g_row = tl.load(gout_ptr + row).to(tl.float32)
 
-    m = _NEG
+    neg_big = -1.0e30
+    m = neg_big
     for start in range(0, V, BLOCK_V):
         offs = start + tl.arange(0, BLOCK_V)
         mask = offs < V
         x = tl.load(
             logits_ptr + base_l + offs * stride_l1,
             mask=mask,
-            other=_NEG,
+            other=neg_big,
         )
         x = x.to(tl.float32)
-        m = tl.maximum(m, tl.max(tl.where(mask, x, _NEG)))
+        m = tl.maximum(m, tl.max(tl.where(mask, x, neg_big)))
 
     acc = 0.0
     for start in range(0, V, BLOCK_V):
