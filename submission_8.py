@@ -1,3 +1,7 @@
+"""v8: Triton @autotune over BLOCK_V/warps/stages + tl.constexpr V/strides + logden cache.
+
+    Differs from submission_9.py, which uses a fixed _LAUNCH table instead of autotune.
+"""
 from __future__ import annotations
 
 import torch
@@ -8,20 +12,6 @@ import triton.language as tl
 _FWD_CACHE: dict = {}
 
 B_FIXED = 4096
-
-# Hand-tuned for A100-class GPUs (competition V only). Replaces @triton.autotune: avoids
-# multi-config benchmarking overhead and locks in tile/warp/stage choices per vocabulary.
-# BLOCK_V must be a power of 2 (tl.arange(0, BLOCK_V)).
-_LAUNCH: dict[int, dict[str, int]] = {
-    32_000: {"BLOCK_V": 8192, "num_warps": 16, "num_stages": 2},
-    50_264: {"BLOCK_V": 8192, "num_warps": 16, "num_stages": 2},
-    # Wider tile → fewer row iterations than 8192 on this V (register use permitting).
-    128_256: {"BLOCK_V": 16384, "num_warps": 16, "num_stages": 2},
-}
-
-
-def _launch_kw(V: int) -> dict[str, int]:
-    return _LAUNCH.get(V, {"BLOCK_V": 4096, "num_warps": 8, "num_stages": 3})
 
 
 def _cache_key(logits: torch.Tensor, targets: torch.Tensor):
@@ -36,6 +26,31 @@ def _cache_key(logits: torch.Tensor, targets: torch.Tensor):
     )
 
 
+# Wider search space; warmup lets autotune pick per-V winners on A100-class GPUs.
+_FWD_CONFIGS = [
+    triton.Config({"BLOCK_V": 512}, num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_V": 1024}, num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_V": 2048}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_V": 2048}, num_warps=8, num_stages=4),
+    triton.Config({"BLOCK_V": 4096}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_V": 4096}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_V": 8192}, num_warps=16, num_stages=1),
+    triton.Config({"BLOCK_V": 8192}, num_warps=16, num_stages=2),
+]
+
+_BWD_CONFIGS = [
+    triton.Config({"BLOCK_V": 512}, num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_V": 1024}, num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_V": 2048}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_V": 2048}, num_warps=8, num_stages=4),
+    triton.Config({"BLOCK_V": 4096}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_V": 4096}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_V": 8192}, num_warps=16, num_stages=1),
+    triton.Config({"BLOCK_V": 8192}, num_warps=16, num_stages=2),
+]
+
+
+@triton.autotune(configs=_FWD_CONFIGS, key=["V"])
 @triton.jit
 def _ce_fwd_kernel(
     logits_ptr,
@@ -85,6 +100,7 @@ def _ce_fwd_kernel(
     tl.store(logden_ptr + row, logden)
 
 
+@triton.autotune(configs=_BWD_CONFIGS, key=["V"])
 @triton.jit
 def _ce_bwd_cached_kernel(
     logits_ptr,
@@ -131,6 +147,7 @@ def _ce_bwd_cached_kernel(
         )
 
 
+@triton.autotune(configs=_BWD_CONFIGS, key=["V"])
 @triton.jit
 def _ce_bwd_recompute_kernel(
     logits_ptr,
@@ -217,9 +234,6 @@ def cross_entropy_forward(logits: torch.Tensor, targets: torch.Tensor) -> torch.
     s0, s1 = int(logits.stride(0)), int(logits.stride(1))
     st = int(targets.stride(0))
 
-    kw = _launch_kw(V)
-    bv, nw, ns = kw["BLOCK_V"], kw["num_warps"], kw["num_stages"]
-
     _ce_fwd_kernel[(B,)](
         logits,
         targets,
@@ -229,9 +243,6 @@ def cross_entropy_forward(logits: torch.Tensor, targets: torch.Tensor) -> torch.
         s0,
         s1,
         st,
-        BLOCK_V=bv,
-        num_warps=nw,
-        num_stages=ns,
     )
 
     _FWD_CACHE[_cache_key(logits, targets)] = logden
@@ -263,9 +274,6 @@ def cross_entropy_backward(
     sgo = int(grad_output.stride(0))
     sg0, sg1 = int(grad.stride(0)), int(grad.stride(1))
 
-    kw = _launch_kw(V)
-    bv, nw, ns = kw["BLOCK_V"], kw["num_warps"], kw["num_stages"]
-
     key = _cache_key(logits, targets)
     logden = _FWD_CACHE.pop(key, None)
 
@@ -283,9 +291,6 @@ def cross_entropy_backward(
             sgo,
             sg0,
             sg1,
-            BLOCK_V=bv,
-            num_warps=nw,
-            num_stages=ns,
         )
     else:
         _ce_bwd_recompute_kernel[(B,)](
@@ -300,9 +305,6 @@ def cross_entropy_backward(
             sgo,
             sg0,
             sg1,
-            BLOCK_V=bv,
-            num_warps=nw,
-            num_stages=ns,
         )
 
     return grad

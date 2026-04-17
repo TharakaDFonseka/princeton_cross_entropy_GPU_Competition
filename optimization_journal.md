@@ -9,7 +9,7 @@
 
 ## Final submission summary
 
-**Primary leaderboard implementation:** **`submission_9.py`** (**v9**) — same **online** softmax and **`logden`** forward→backward **cache** as **v7**; **`tl.constexpr`** on **`V`** and strides; **no `@triton.autotune`**. Instead, a hand-maintained **`_LAUNCH`** table picks **`BLOCK_V`**, **`num_warps`**, and **`num_stages`** **per competition vocabulary** (power-of-2 **`BLOCK_V`** only: **8192** for **32k/50k**, **16384** for **128k**, **`num_warps = 16`**, **`num_stages = 2`**) so each **`V`** uses a **fixed** launch tuned for **A100**-class bandwidth (fewer outer-loop trips on wide tiles; **128k** uses a **16384** tile to roughly halve softmax iterations vs **8192** where registers allow). **`submission_8.py`** is kept **in sync** with **`submission_9.py`** (same code path). **Best Popcorn time** recorded here: **875.111 μs** (official leaderboard). **Earlier line in this journal:** **v8** at **908.166 μs** used **wider autotune** instead of the fixed table; **v7** **936.952 μs**. **`submission_6.py`** (**v6**, **1236.180 μs**) remains the **cache-free** baseline. Earlier versions (**v1–v3**) use **`torch.compile`**; **v4** was the first full-Triton Popcorn baseline (**1992.267 μs**).
+**Primary leaderboard implementation:** **`submission_9.py`** (**v9**) — same **online** softmax and **`logden`** forward→backward **cache** as **v7**; **`tl.constexpr`** on **`V`** and strides; **no `@triton.autotune`**. Instead, a hand-maintained **`_LAUNCH`** table picks **`BLOCK_V`**, **`num_warps`**, and **`num_stages`** **per competition vocabulary** (power-of-2 **`BLOCK_V`** only: **8192** for **32k/50k**, **16384** for **128k**, **`num_warps = 16`**, **`num_stages = 2`**) so each **`V`** uses a **fixed** launch tuned for **A100**-class bandwidth. **`submission_8.py`** (**v8**) is **not** the same program: it uses **`@triton.autotune`** over multiple **`BLOCK_V`** / warps / stages (**908.166 μs** here) instead of **`_LAUNCH`**. **Best Popcorn time** recorded here: **875.111 μs** (**v9**, official leaderboard). **v7** **936.952 μs**. **`submission_6.py`** (**v6**, **1236.180 μs**) remains the **cache-free** baseline. Earlier versions (**v1–v3**) use **`torch.compile`**; **v4** was the first full-Triton Popcorn baseline (**1992.267 μs**).
 
 **Files (versions + default upload name):**
 
@@ -22,8 +22,8 @@
 | `submission_5.py` | **v5** — **Triton** with **online** max + LSE in one tiled sweep; piecewise **`BLOCK_V`** (2048 for 32k/50k, 4096 for 128k); Popcorn **1270.465 μs**. |
 | `submission_6.py` | **v6** — **Same online kernels as v5**; **uniform `BLOCK_V = 4096`** for all **V**; Popcorn **1236.180 μs**. |
 | `submission_7.py` | **v7** — cached **`logden`**, autotune, stride-based I/O, int64 targets in-kernel; Popcorn **936.952 μs**. |
-| `submission_8.py` | **v8** — same implementation family as **v9**; historically also tracked **autotune-heavy** variants; keep aligned with **`submission_9.py`** for the hand-tuned path. |
-| `submission_9.py` | **v9** — **`logden`** cache + **`constexpr`** + **hand-tuned `_LAUNCH`** (no autotune); Popcorn **875.111 μs** (**best** here). |
+| `submission_8.py` | **v8** — **`logden`** cache + **`tl.constexpr`** **`V`/strides** + **`@triton.autotune`** (wider **`BLOCK_V`** grid **512–8192**, **`num_warps`** up to **16**); **no** fixed **`_LAUNCH`** table — kernels pick config after warmup. Popcorn **908.166 μs**. |
+| `submission_9.py` | **v9** — **`logden`** cache + **`constexpr`** + **hand-tuned `_LAUNCH`** per **`V`** (**no** `@triton.autotune`); Popcorn **875.111 μs** (**best** here). |
 | `submission.py` | **Copy of the version you submit** — for Popcorn: **`cp submission_9.py submission.py`** (best **μs** recorded here). |
 
 ### submission_1 vs submission_2 (what changed)
@@ -309,7 +309,7 @@ For large **V**, the kernel is **memory-bound**; every **extra** full read of th
 - **Removed `@triton.autotune`** from forward and backward kernels.
 - **`_LAUNCH: dict[int, …]`** maps **`V ∈ {32000, 50264, 128256}`** to **`{BLOCK_V, num_warps, num_stages}`**. Launch passes **`BLOCK_V=`**, **`num_warps=`**, **`num_stages=`** with **`tl.constexpr`** **`V`** and strides unchanged.
 - **Default table (A100-oriented):** **32k / 50k** → **`BLOCK_V = 8192`**, **`num_warps = 16`**, **`num_stages = 2`**; **128k** → **`BLOCK_V = 16384`** (fewer **for start in range(0, V, BLOCK_V)** iterations than **8192** on that row length), same warps/stages. **`BLOCK_V`** must stay a **power of 2** (Triton **`arange`** rule).
-- **`submission_8.py`** is maintained as a **duplicate** of this design for naming flexibility.
+- **`submission_9.py` only:** **`submission_8.py`** still contains **`@triton.autotune`** on the kernels; do not merge the two files without choosing one launch strategy.
 
 **Why results are expected to improve (vs autotune-heavy v8).**
 
@@ -343,7 +343,7 @@ For large **V**, the kernel is **memory-bound**; every **extra** full read of th
 
 **Comparison on the same leaderboard metric:** **908.166 μs (v8) → 875.111 μs (v9)** → about **3.6%** lower wall time (**~1.038×** faster in the ratio **908.166 / 875.111**). **936.952 μs (v7) → 875.111 μs (v9)** → about **6.6%** lower than **v7**.
 
-**Current choice for submission.** **`submission_9.py`** (**v9**) is the **best Popcorn μs** and harness geomean in this journal; keep **`submission_8.py`** aligned if you maintain two filenames.
+**Current choice for submission.** **`submission_9.py`** (**v9**) is the **best Popcorn μs** and harness geomean in this journal. Use **`submission_8.py`** when you want the **autotuning** variant (different **`.py`** file — not a copy of **v9**).
 
 ## Rubric answers (assignment prompts — consolidated)
 
@@ -610,7 +610,7 @@ One **`test_cross_entropy.py`** run per file on **A100 80GB**, **PyTorch 2.11.0*
 
 ### Final Triton submission (**v9**) on **A100**
 
-Official rank uses **Popcorn**; local check: **`python test_cross_entropy.py submission_9.py`**. Primary implementation: **`submission_9.py`** (**875.111 μs** Popcorn in this journal). **`submission_8.py`** matches the same **hand-tuned** code path (keep in sync). **`submission_7.py`** (**936.952 μs**) remains a reference with **autotune**; **`submission_6.py`** (**1236.180 μs**) remains the **no-cache** baseline.
+Official rank uses **Popcorn**; local check: **`python test_cross_entropy.py submission_9.py`**. Primary implementation: **`submission_9.py`** (**875.111 μs** Popcorn in this journal). **`submission_8.py`** is the **autotuned** variant (**v8**, **908.166 μs** — **`@triton.autotune`**, not **`_LAUNCH`**). **`submission_7.py`** (**936.952 μs**) remains a reference; **`submission_6.py`** (**1236.180 μs**) remains the **no-cache** baseline.
 
 **After Popcorn / grader PyTorch 2.11**, refresh harness rows if medians shift; add **v9** rows to the **80GB** bandwidth table when you paste a full **`test_cross_entropy.py submission_9.py`** run on **A100 80GB**.
 
@@ -767,4 +767,4 @@ Alternatively: `cp submission_9.py submission.py` and submit **`submission.py`**
 
 ## Short note to include in the notebook
 
-I documented my optimization process in this journal. I compared **submission_1** and **submission_2** (`torch.compile` + stable backward without `probs.clone()`). **submission_3** (narrow forward + `gather` under compile) **passed** correctness but was **slower** than v2 in Colab (see **Version 3**). **submission_4** implements **forward and backward in Triton** (row-parallel, tiled **V**), fixes the **`_NEG` global / Triton JIT** issue with a local sentinel, and **improved Popcorn** from **2716.164 μs (v2)** to **1992.267 μs**. **submission_5** applies an **online softmax**-style fused reduction, and reached **1270.465 μs** on Popcorn. **submission_6** uses a **uniform `BLOCK_V = 4096`** and reached **1236.180 μs**. **submission_7** caches per-row **log ∑ e^x** and reached **936.952 μs**. **submission_8** adds **`tl.constexpr`** and **wider autotune** (**908.166 μs**). **submission_9** removes autotune in favor of a **hand-tuned `_LAUNCH`** table per competition **V** (e.g. **8192** for **32k/50k**, **16384** for **128k**), reaching **875.111 μs** on Popcorn and **~9.36×** geomean speedup vs eager on **Colab A100 40GB** / **PyTorch 2.10** (**Version 9**). **submission_8** is kept aligned with **submission_9**. **Achieved memory bandwidth** includes **v7–v9** harness rows. For upload, use **`submission_9.py`**. Avoid **`torch.compile`** on Popcorn if the server reports **multi-stream** errors. Local/Colab numbers use **`test_cross_entropy.py`**; the grader uses **PyTorch 2.11** and **Triton 3.6** on **A100 80GB**.
+I documented my optimization process in this journal. I compared **submission_1** and **submission_2** (`torch.compile` + stable backward without `probs.clone()`). **submission_3** (narrow forward + `gather` under compile) **passed** correctness but was **slower** than v2 in Colab (see **Version 3**). **submission_4** implements **forward and backward in Triton** (row-parallel, tiled **V**), fixes the **`_NEG` global / Triton JIT** issue with a local sentinel, and **improved Popcorn** from **2716.164 μs (v2)** to **1992.267 μs**. **submission_5** applies an **online softmax**-style fused reduction, and reached **1270.465 μs** on Popcorn. **submission_6** uses a **uniform `BLOCK_V = 4096`** and reached **1236.180 μs**. **submission_7** caches per-row **log ∑ e^x** and reached **936.952 μs**. **submission_8** adds **`tl.constexpr`** and **wider autotune** (**908.166 μs**). **submission_9** removes autotune in favor of a **hand-tuned `_LAUNCH`** table per competition **V** (e.g. **8192** for **32k/50k**, **16384** for **128k**), reaching **875.111 μs** on Popcorn and **~9.36×** geomean speedup vs eager on **Colab A100 40GB** / **PyTorch 2.10** (**Version 9**). **submission_8** (**autotune**) and **submission_9** (**hand-tuned `_LAUNCH`**) are **separate** source files; do not assume they stay identical. **Achieved memory bandwidth** includes **v7–v9** harness rows. For upload, use **`submission_9.py`**. Avoid **`torch.compile`** on Popcorn if the server reports **multi-stream** errors. Local/Colab numbers use **`test_cross_entropy.py`**; the grader uses **PyTorch 2.11** and **Triton 3.6** on **A100 80GB**.

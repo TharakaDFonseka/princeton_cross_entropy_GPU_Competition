@@ -1,3 +1,7 @@
+"""v9: Hand-tuned _LAUNCH per V (no @autotune) + tl.constexpr + logden cache.
+
+    Differs from submission_8.py, which uses @triton.autotune to pick BLOCK_V/warps/stages.
+"""
 from __future__ import annotations
 
 import torch
