@@ -9,7 +9,7 @@
 
 ## Final submission summary
 
-**Primary leaderboard implementation:** **`submission_7.py`** (**v7**) — Triton **online** row reduction, **`@triton.autotune`** over a small **`BLOCK_V` / warps / stages** grid, **no** `logits.contiguous()` / **`targets.to(int32)`** in Python (strides into kernels; **int64** targets loaded in-kernel and cast for indexing), and a **forward → backward** cache of per-row **log ∑ⱼ e^{xⱼ}** (`logden`) so the **cached backward** does **one** full logits sweep instead of two when the harness calls backward immediately after forward on the same tensors. **Best Popcorn time** recorded here: **936.952 μs** (official leaderboard). **`submission_6.py`** (**v6**, **1236.180 μs**) remains the last **cache-free**, **fixed-config** Triton variant for comparison. Earlier versions (**v1–v3**) use **`torch.compile`**; **v4** was the first full-Triton Popcorn baseline (**1992.267 μs**).
+**Primary leaderboard implementation:** **`submission_9.py`** (**v9**) — same **online** softmax and **`logden`** forward→backward **cache** as **v7**; **`tl.constexpr`** on **`V`** and strides; **no `@triton.autotune`**. Instead, a hand-maintained **`_LAUNCH`** table picks **`BLOCK_V`**, **`num_warps`**, and **`num_stages`** **per competition vocabulary** (power-of-2 **`BLOCK_V`** only: **8192** for **32k/50k**, **16384** for **128k**, **`num_warps = 16`**, **`num_stages = 2`**) so each **`V`** uses a **fixed** launch tuned for **A100**-class bandwidth (fewer outer-loop trips on wide tiles; **128k** uses a **16384** tile to roughly halve softmax iterations vs **8192** where registers allow). **`submission_8.py`** is kept **in sync** with **`submission_9.py`** (same code path). **Best Popcorn time** recorded here: **875.111 μs** (official leaderboard). **Earlier line in this journal:** **v8** at **908.166 μs** used **wider autotune** instead of the fixed table; **v7** **936.952 μs**. **`submission_6.py`** (**v6**, **1236.180 μs**) remains the **cache-free** baseline. Earlier versions (**v1–v3**) use **`torch.compile`**; **v4** was the first full-Triton Popcorn baseline (**1992.267 μs**).
 
 **Files (versions + default upload name):**
 
@@ -21,8 +21,10 @@
 | `submission_4.py` | **v4** — **Triton** CE forward + backward (separate max pass, then sum-exp pass, then grad pass on backward); Popcorn **1992.267 μs** (superseded by **v5–v7**). |
 | `submission_5.py` | **v5** — **Triton** with **online** max + LSE in one tiled sweep; piecewise **`BLOCK_V`** (2048 for 32k/50k, 4096 for 128k); Popcorn **1270.465 μs**. |
 | `submission_6.py` | **v6** — **Same online kernels as v5**; **uniform `BLOCK_V = 4096`** for all **V**; Popcorn **1236.180 μs**. |
-| `submission_7.py` | **v7** — cached **`logden`**, autotune, stride-based I/O, int64 targets in-kernel; Popcorn **936.952 μs** (**best** here). |
-| `submission.py` | **Copy of the version you submit** — for Popcorn: **`cp submission_7.py submission.py`** (best **μs** recorded here). |
+| `submission_7.py` | **v7** — cached **`logden`**, autotune, stride-based I/O, int64 targets in-kernel; Popcorn **936.952 μs**. |
+| `submission_8.py` | **v8** — same implementation family as **v9**; historically also tracked **autotune-heavy** variants; keep aligned with **`submission_9.py`** for the hand-tuned path. |
+| `submission_9.py` | **v9** — **`logden`** cache + **`constexpr`** + **hand-tuned `_LAUNCH`** (no autotune); Popcorn **875.111 μs** (**best** here). |
+| `submission.py` | **Copy of the version you submit** — for Popcorn: **`cp submission_9.py submission.py`** (best **μs** recorded here). |
 
 ### submission_1 vs submission_2 (what changed)
 
@@ -250,21 +252,112 @@ For large **V**, the kernel is **memory-bound**; every **extra** full read of th
 
 **Competition-style geomean speedup (printed):** **~8.91×** vs eager on that run (product of speedups **8.74 × 8.43 × 9.59** cube-root).
 
-**Current choice for submission.** **v7 (`submission_7.py`)** is the **best measured Popcorn** implementation in this journal; **v6** is the fixed-config baseline; **v5** documents the **online softmax** design.
+**Current choice for submission.** **v7 (`submission_7.py`)** was the **best measured Popcorn** implementation until **v8**; **v6** is the fixed-config baseline; **v5** documents the **online softmax** design.
+
+### Version 8 — `tl.constexpr` specialization + wider autotune (`submission_8.py`)
+
+**Motivation.** After **v7**, incremental gains require squeezing more from the **same** math: better **tile / occupancy** choices per vocabulary size, and helping the Triton compiler **specialize** kernels for fixed **`B`**, **`V`**, and typical **strides** so inner loops and loads match what the benchmark actually uses.
+
+**What we implemented.**
+
+- **Same algorithmic contract as v7:** **`B_FIXED = 4096`**, **online** forward (**max** + running **sum of exp**), store per-row **`logden`** for a process-local **cache**; **cached backward** = one tiled pass **`p = exp(x − logden)`**, **`grad = p·g`**, subtract **`g`** on the target column; **recompute backward** = v6-style two passes if the cache misses.
+- **`tl.constexpr` on `V` and strides** (`stride_l0`, `stride_l1`, `stride_t0`, and backward grad strides): passed as Python **`int(...)`** from **`logits` / `targets` / `grad_output` / `grad`** so each **`(V, layout)`** pair can compile to a **specialized** kernel (known trip counts and indexing for the competition’s **`[4096, V]`** contiguous case).
+- **Wider `@triton.autotune`** lists: **`BLOCK_V` ∈ {512, 1024, 2048, 4096, 8192}** with multiple **`num_stages`** pairs (e.g. **2048** and **4096** with stages **3–4**, **8192** with **`num_warps = 16`** and stages **1–2**). Warmup lets Triton pick a better **tile × pipeline depth** per **`V`** on **A100-class** GPUs (memory-bound softmax rows).
+- **Micro-optimizations** retained from earlier tuning: **`exp * mask`** for masked tile sums (avoids **`tl.where`** in the reduction), **`grad - g * ((offs == tgt) & mask)`** for the one-hot term.
+
+**Why this is expected to use less time (when it wins).**
+
+- **Autotune:** Different **`V`** values change how many partial tiles appear at the end of a row; a **larger search space** can find a config with **fewer loop iterations** or better **memory-level parallelism** (`num_stages`) for that **`V`**.
+- **`constexpr` `V` / strides:** Lets the compiler treat **row length** and **pointer arithmetic** as **compile-time** facts for the common **contiguous** case, which can reduce overhead vs fully dynamic bounds.
+- **Cache hit path (unchanged from v7):** Combined **forward + backward** still avoids **one** full logits read on backward vs recomputing **logden** — the dominant term when the harness runs **fwd** then **bwd** on the same tensors.
+
+**Caveats (same family as v7, plus tuning risk).**
+
+- **Cross-call cache** still assumes no **in-place** **`logits`** mutation between forward and backward for the same storage.
+- **Larger autotune** grids increase **first-touch compile** time; acceptable if warmup is outside the timed region (course harness / Popcorn pattern).
+- This journal previously associated **`tl.constexpr V`**, **`num_warps = 16`**, and high **`num_stages`** with occasional **Popcorn HTTP 500** / multi-stream issues in **other** iterations; **v8** reintroduces those knobs deliberately for speed — if the remote grader misbehaves, trim configs or drop **`constexpr`** first.
+
+**Local harness (`test_cross_entropy.py`) — one A100-class session (median ms, printed geomean speedup vs eager):**
+
+```
+        V |   Fwd ms   Bwd ms  Fwd+Bwd ms |     Fwd BW     Bwd BW  Fwd+Bwd BW |  Speedup
+    32000 |   0.248    0.488       0.649  |   1058.0    1073.5     1211.5  |    8.77x
+    50264 |   0.359    0.887       0.994  |   1145.8     928.7     1242.5  |    9.18x
+   128256 |   0.827    2.416       2.418  |   1270.7     869.7     1303.8  |    9.62x
+```
+
+**Competition-style score from this run:** geometric mean speedup vs the script’s eager baseline ≈ **9.18×**.
+
+**Popcorn leaderboard (official).** Ranked submit of **`submission_8.py`**:
+
+| Field | Value |
+|------|--------|
+| User | **TharakaDFonseka** |
+| Reported combined time | **908.166 μs** (~**0.908 ms**) |
+
+**Comparison on the same leaderboard metric:** **936.952 μs (v7) → 908.166 μs (v8)** → about **3.1%** lower wall time (**~1.032×** faster in the ratio **936.952 / 908.166**).
+
+**Current choice for submission.** **v8 (`submission_8.py`)** improved over **v7** via **`constexpr`** + **wider autotune** (**908.166 μs**); **v9** (**`submission_9.py`**) supersedes **v8** with **fixed per-`V` launches** (**875.111 μs** — see **Version 9**).
+
+### Version 9 — Hand-tuned per-vocabulary launch, no autotune (`submission_9.py`)
+
+**Motivation.** **v8** added **`tl.constexpr`** and a **large `@triton.autotune`** grid so Triton could pick **`BLOCK_V` / warps / stages** per **`V`**. In practice, autotune **benchmarks many configs** (compile + timing during warmup), can pick a **suboptimal** winner on a given stack, and **`tl.arange(0, BLOCK_V)`** requires **power-of-2** **`BLOCK_V`** — so non-power-of-2 tile ideas fail outright. Empirically, **manual tuning** per competition **`V`** (only three values) gives **more control** than expanding autotune further, with **predictable** behavior on **A100**.
+
+**What we implemented.**
+
+- **Same math and cache as v7/v8:** **online** row softmax (**max** + running **sum of exp**), **`logden = m + log(s)`** stored; **Python** cache keyed by tensor identity; **cached backward** = **`exp(x − logden)`** one sweep; **recompute** path if cache misses.
+- **Removed `@triton.autotune`** from forward and backward kernels.
+- **`_LAUNCH: dict[int, …]`** maps **`V ∈ {32000, 50264, 128256}`** to **`{BLOCK_V, num_warps, num_stages}`**. Launch passes **`BLOCK_V=`**, **`num_warps=`**, **`num_stages=`** with **`tl.constexpr`** **`V`** and strides unchanged.
+- **Default table (A100-oriented):** **32k / 50k** → **`BLOCK_V = 8192`**, **`num_warps = 16`**, **`num_stages = 2`**; **128k** → **`BLOCK_V = 16384`** (fewer **for start in range(0, V, BLOCK_V)** iterations than **8192** on that row length), same warps/stages. **`BLOCK_V`** must stay a **power of 2** (Triton **`arange`** rule).
+- **`submission_8.py`** is maintained as a **duplicate** of this design for naming flexibility.
+
+**Why results are expected to improve (vs autotune-heavy v8).**
+
+- **No autotune lottery:** The timed region avoids depending on which config “won” after a finite benchmark budget.
+- **Wider tiles where it matters:** **8192** vs **4096** reduces **outer-loop** iterations on **32k/50k**; **16384** on **128k** targets the largest **V** where iteration count dominates scheduling overhead.
+- **`num_warps = 16`** on large tiles aims at **memory throughput** on **A100**; **`num_stages = 2`** is a common pipeline choice for **HBM-bound** row kernels.
+- **Same `logden` cache:** Combined **fwd+bwd** still saves **one** full logits pass on backward when the harness runs forward then backward on the same tensors — unchanged from **v7**.
+
+**Caveats.**
+
+- **16384** tiles increase **per-tile register / SRAM** pressure; if a stack **fails to compile**, fall back to **`BLOCK_V = 8192`** for **128256** in **`_LAUNCH`**.
+- Tuning is **GPU-specific**; **A100 40GB vs 80GB** is usually similar for this kernel; **Popcorn** remains the authority.
+
+**Harness (`test_cross_entropy.py`) — Google Colab, `/content`, GPU **NVIDIA A100-SXM4-40GB**, **PyTorch 2.10.0+cu128**, **`B = 4096`**. Correctness: **PASS** all **V** (max |fwd|/|bwd| error **~1e−6** order). Printed table:
+
+```
+        V |   Fwd ms   Bwd ms  Fwd+Bwd ms |     Fwd BW     Bwd BW  Fwd+Bwd BW |  Speedup
+    32000 |   0.231    0.470       0.628  |   1133.0    1116.8     1253.0  |    9.06x
+    50264 |   0.347    0.867       0.979  |   1186.3     949.6     1262.0  |    9.32x
+   128256 |   0.812    2.358       2.392  |   1293.9     891.3     1317.7  |    9.72x
+```
+
+**Competition-style score from this run:** geometric mean speedup vs eager ≈ **9.36×**.
+
+**Popcorn leaderboard (official).** Ranked submit of **`submission_9.py`**:
+
+| Field | Value |
+|------|--------|
+| User | **TharakaDFonseka** |
+| Reported combined time | **875.111 μs** (~**0.875 ms**) |
+
+**Comparison on the same leaderboard metric:** **908.166 μs (v8) → 875.111 μs (v9)** → about **3.6%** lower wall time (**~1.038×** faster in the ratio **908.166 / 875.111**). **936.952 μs (v7) → 875.111 μs (v9)** → about **6.6%** lower than **v7**.
+
+**Current choice for submission.** **`submission_9.py`** (**v9**) is the **best Popcorn μs** and harness geomean in this journal; keep **`submission_8.py`** aligned if you maintain two filenames.
 
 ## Rubric answers (assignment prompts — consolidated)
 
-The bullets below mirror the course questions. Detailed narrative lives in **Versions 1–7**, **Timing table**, **Achieved memory bandwidth**, and **Approaches I tried**.
+The bullets below mirror the course questions. Detailed narrative lives in **Versions 1–9**, **Timing table**, **Achieved memory bandwidth**, and **Approaches I tried**.
 
 ### What approaches did you try?
 
 | Category | What we did (files) |
 |----------|---------------------|
 | **`torch.compile`** | **v1–v3**, **`submission.py`** aligned with **v2**/**v3**: `max-autotune-no-cudagraphs`, stable softmax backward, optional narrow forward (**v3**). |
-| **Custom Triton kernels** | **v4** (two-pass fwd / three-pass bwd over row), **v5** (**online** max + sum in one fwd pass; two-pass bwd), **v6** (uniform wide **`BLOCK_V`** vs **v5**’s mixed tile), **v7** (cached **`logden`** + autotune + stride-based loads). |
+| **Custom Triton kernels** | **v4** (two-pass fwd / three-pass bwd over row), **v5** (**online** max + sum in one fwd pass; two-pass bwd), **v6** (uniform wide **`BLOCK_V`** vs **v5**’s mixed tile), **v7** (cached **`logden`** + autotune + stride-based loads), **v8** (**v7** + **`tl.constexpr`** **`V`/strides** + wider autotune), **v9** (**v7/v8** math + **`constexpr`** + **hand-tuned `_LAUNCH`**, **no** autotune). |
 | **Fused forward + backward** | **Not in one API call** — harness requires separate **`cross_entropy_forward`** / **`cross_entropy_backward`**. **Within** backward, **v5–v6** fuse max+sum-exp (**online**) vs **v4**’s separate passes; **v7** skips recomputation of **`logden`** on cache hit (**one** logits pass). |
 | **Memory layout** | **v4–v6:** **`logits.contiguous()`**, **`targets`**, **`grad_output`** before kernels. **v7:** no forced **`contiguous()`** on logits / `grad_output`; **int64** **`targets`**, strides passed into kernels. |
-| **Block size / launch tuning** | **v4–v6:** hand-picked **`BLOCK_V`**, **`num_warps=8`**, **`num_stages=2`** (with **v5**’s mixed tile). **v7:** **`@triton.autotune`** over **1024 / 2048 / 4096** × warps/stages, **`key=['V']`**. |
+| **Block size / launch tuning** | **v4–v6:** hand-picked **`BLOCK_V`**, **`num_warps=8`**, **`num_stages=2`** (with **v5**’s mixed tile). **v7:** **`@triton.autotune`** over **1024 / 2048 / 4096** × warps/stages, **`key=['V']`**. **v8:** wider grid (**512–8192**, **`num_warps`** up to **16**, multiple **`num_stages`**). **v9:** **no** autotune — **`_LAUNCH[V]`** sets **`BLOCK_V` / warps / stages** per competition **V** (e.g. **8192** / **16384**). |
 
 ### For each approach: timing vs previous best and why
 
@@ -275,14 +368,18 @@ The bullets below mirror the course questions. Detailed narrative lives in **Ver
 | **v5** online | **1992 → 1270** (**~1.57×** vs **v4**) | **One fewer** full-row read on backward; forward max+sum merged (**online softmax**). |
 | **v6** uniform **4096** | **1270 → 1236** (**~1.03×** vs **v5**) | Fewer outer-loop iterations on **32k/50k**; same HBM asymptotics, less loop overhead. |
 | **v7** cache + autotune | **1236 → 937** (**~1.32×** vs **v6**) | Reuse **`logden`** so backward often **one** logits pass; leaner Python I/O; autotuned tile. |
+| **v8** constexpr + wider autotune | **937 → 908** (**~1.03×** vs **v7**, Popcorn) | **`tl.constexpr`** **`V`/strides**; larger **`BLOCK_V` / warps / stages`** search; same **`logden`** cache path. |
+| **v9** hand-tuned **`_LAUNCH`**, no autotune | **908 → 875** (**~1.04×** vs **v8**, Popcorn) | Fixed **tile × warps × stages** per **V**; **16384** tile on **128k**; avoids autotune variance. |
 
-Colab **`test_cross_entropy.py`** tables (per-**V** ms, geomean **×** vs *local* eager) are in **Versions 2–5** and **Version 7**; they are **not** identical to Popcorn **μs** but support **before/after** comparisons for each approach. **Achieved memory bandwidth** adds an **A100 80GB** harness session for **v1–v6** with **% of peak**; **v7** includes a **Colab A100 40GB** harness row set.
+Colab **`test_cross_entropy.py`** tables (per-**V** ms, geomean **×** vs *local* eager) are in **Versions 2–5**, **Version 7**, **Version 8**, and **Version 9**; they are **not** identical to Popcorn **μs** but support **before/after** comparisons for each approach. **Achieved memory bandwidth** adds an **A100 80GB** harness session for **v1–v6** with **% of peak**; **v7**–**v9** include **Colab** / local harness row sets.
 
 ### Final submission: achieved bandwidth and % of peak (2039 GB/s)
 
 Use the harness on the **same GPU as the write-up** (ideally **A100 80GB**):
 
 ```bash
+python test_cross_entropy.py submission_9.py
+python test_cross_entropy.py submission_8.py
 python test_cross_entropy.py submission_7.py
 python test_cross_entropy.py submission_6.py
 ```
@@ -293,7 +390,7 @@ For each **V**, the script prints **Fwd BW**, **Bwd BW**, and **Fwd+Bwd BW** (GB
 \frac{\text{Fwd+Bwd BW (GB/s)}}{2039}\times 100\%.
 \]
 
-**This journal** tabulates **% of peak** for **v1–v6** from one **A100 80GB** **`test_cross_entropy.py`** session (see **Achieved memory bandwidth**) and keeps **historical** **A100 40GB** Colab rows for **v2**/**v3** in **Version 2** / **Version 3** for comparison. **v7** adds **A100 40GB** Colab harness bandwidth rows (**Version 7**); refresh on **80GB** when available.
+**This journal** tabulates **% of peak** for **v1–v6** from one **A100 80GB** **`test_cross_entropy.py`** session (see **Achieved memory bandwidth**) and keeps **historical** **A100 40GB** Colab rows for **v2**/**v3** in **Version 2** / **Version 3** for comparison. **v7**–**v9** add **Colab A100 40GB** harness rows (**Version 7** / **Version 8** / **Version 9**); refresh on **80GB** when available.
 
 ### What prevents reaching 100% of peak?
 
@@ -364,7 +461,7 @@ where `g = grad_output[:, None]`.
 
 ---
 
-### 6) Uniform wide tile (**submission_6** — best fixed-config Popcorn before v7)
+### 6) Uniform wide tile (**submission_6** — best fixed-config Popcorn before v7/v8)
 **Idea:** Keep **v5**’s **kernels and launch metadata** unchanged; use **`BLOCK_V = 4096`** for **all** competition **V** instead of **2048** for **32k / 50k** and **4096** only for **128k**.
 
 **Why try it:** Fewer **outer-loop** trips per row can reduce overhead on an already **fused** kernel; standard **tiling** intuition without new math or extra CUDA streams.
@@ -373,7 +470,7 @@ where `g = grad_output[:, None]`.
 
 ---
 
-### 7) Cached **`logden`** + autotune + lean I/O (**submission_7** — **best Popcorn μs in this journal**)
+### 7) Cached **`logden`** + autotune + lean I/O (**submission_7**)
 **Idea:** When **backward** runs right after **forward** on the same **`(logits, targets)`**, reuse the forward-computed per-row **log-partition** \(\log\sum_j e^{x_j}\) instead of recomputing it in a separate full pass over logits; add **`@triton.autotune`**; avoid redundant **`contiguous()`** / **`int32`** casts in Python.
 
 **Why try it:** The score is **combined** fwd+bwd; skipping **one** full-row logits read on backward dominates at large **V**. Smaller Python and launch overhead helps at the margin.
@@ -382,16 +479,34 @@ where `g = grad_output[:, None]`.
 
 ---
 
-### 8) Ideas not used (beyond v7)
-- Single fused kernel spanning both API calls (not exposed by the harness).
-- Very large autotune grids (compile-time cost); **v7** uses a **small** config list only.
-- **Popcorn-hostile experiments (avoided in earlier iterations):** `torch.compile` on **`submission.py`** (extra streams on their checker); **constexpr `V`**, **fused target-in-loop + `num_warps=16`**, **eviction_policy**, **`num_stages > 2`** — associated with **HTTP 500** / stream errors in this workspace until reverted to **v5-shaped** kernels.
+### 8) **`tl.constexpr`** **`V`/strides** + wider autotune (**submission_8**)
+**Idea:** Keep **v7**’s **online** kernels and **`logden`** cache; mark **`V`** and tensor **strides** as **`tl.constexpr`** so Triton specializes for each competition vocabulary and contiguous layout; expand **`@triton.autotune`** to include **smaller and larger** **`BLOCK_V`** (down to **512**, up to **8192**), more **`num_stages`** pairs, and **`num_warps = 16`** on wide tiles.
 
-**Why v2–v3 stayed in the story:** They document the **compile path**; **v4–v7** document when **explicit kernels**, **fused reductions**, **tiling**, and **cross-call reuse** win or need measurement.
+**Why try it:** After **v7**, remaining time is mostly **scheduling** (tile width, warps, pipeline stages) and **compiler specialization**; a broader search plus **constexpr** bounds targets both without changing numerics.
+
+**What happened:** **`test_cross_entropy.py`** geomean speedup **~9.18×** vs eager in one session (table in **Version 8**); Popcorn **936.952 μs (v7) → 908.166 μs (v8)**.
+
+---
+
+### 9) Hand-tuned **`_LAUNCH`**, no autotune (**submission_9** — **best Popcorn μs in this journal**)
+**Idea:** Keep **v7**/**v8** kernel bodies and **`logden`** cache; **remove `@triton.autotune`**; use a Python dict **`_LAUNCH`** mapping each competition **`V`** to **`BLOCK_V`**, **`num_warps`**, **`num_stages`** (power-of-2 tiles only), and launch kernels with explicit **`kwargs**.
+
+**Why try it:** Autotune can **overfit** its benchmark budget or pick configs that are not best on the grader; **three** discrete **V** values allow **manual** A100-oriented tuning; **wider** **`BLOCK_V`** (e.g. **16384** for **128k**) reduces **loop** iteration count.
+
+**What happened:** Popcorn **908.166 μs (v8) → 875.111 μs (v9)**; harness **~9.36×** geomean speedup vs eager on **Colab A100 40GB** / **PyTorch 2.10** — **Version 9** table.
+
+---
+
+### 10) Ideas not used (beyond v9)
+- Single fused kernel spanning both API calls (not exposed by the harness).
+- **v8** intentionally uses a **larger** autotune grid than **v7** (compile-time tradeoff vs peak runtime); **v9** drops autotune for a **fixed** table.
+- **Popcorn-hostile experiments (historical note):** `torch.compile` on **`submission.py`** (extra streams on some checkers); **`eviction_policy`**, some **`constexpr` / `num_warps=16`** combinations — occasionally associated with **HTTP 500** / stream errors in **earlier** iterations — trim if the grader misbehaves.
+
+**Why v2–v3 stayed in the story:** They document the **compile path**; **v4–v9** document when **explicit kernels**, **fused reductions**, **tiling**, **cross-call reuse**, **autotune + constexpr**, and **hand-tuned launch** win or need measurement.
 
 ## Why the final version should be faster than eager
 
-Cross-entropy is mainly **memory-bound**, so reducing HBM traffic matters more than increasing raw FLOPs. That means fusion is important. **v5** goes one step further than **v4** by fusing the **row max** and **exponential sum** into **one** sweep (and saving a full backward pass), which directly targets global-memory traffic on each row. **v6** does not change that traffic model; it tunes **tile width** so each row needs **fewer** loop iterations on **32k / 50k**, which helped slightly on **Popcorn** (**1236.180 μs** vs **1270.465 μs** for **v5**). **v7** cuts another full-row pass on the backward **hot path** when **`logden`** is reused, which is why **Popcorn** dropped to **936.952 μs**.
+Cross-entropy is mainly **memory-bound**, so reducing HBM traffic matters more than increasing raw FLOPs. That means fusion is important. **v5** goes one step further than **v4** by fusing the **row max** and **exponential sum** into **one** sweep (and saving a full backward pass), which directly targets global-memory traffic on each row. **v6** does not change that traffic model; it tunes **tile width** so each row needs **fewer** loop iterations on **32k / 50k**, which helped slightly on **Popcorn** (**1236.180 μs** vs **1270.465 μs** for **v5**). **v7** cuts another full-row pass on the backward **hot path** when **`logden`** is reused (**936.952 μs**). **v8** adds **`constexpr`** and **wider autotune** (**908.166 μs**). **v9** keeps the same **HBM** story and **`logden`** reuse but **fixes** launch parameters per **`V`** (**875.111 μs** on Popcorn here), avoiding autotune variance.
 
 Relevant references:
 - Triton fused softmax tutorial: https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html
@@ -421,8 +536,10 @@ Byte counts and bandwidth below match `test_cross_entropy.py`:
 | **submission_6** (v5 + uniform `BLOCK_V=4096`) | (Colab harness) | (Colab harness) | (per-**V** from latest run) | **Popcorn combined 1236.180 μs** (official); same online kernels as **v5**, wide-tile scheduling only. |
 | **submission_6** (full harness, **80GB**) | **0.250 / 0.422 / 0.827** | **0.643 / 1.059 / 2.427** | **0.843 / 1.419 / 3.193** | **A100 80GB** session; **geomean speedup 6.82×**. |
 | **submission_7** (full harness, **40GB** Colab) | **0.250 / 0.410 / 0.823** | **0.639 / 1.072 / 2.422** | **0.652 / 1.083 / 2.427** | **PyTorch 2.10.0+cu128**; **geomean speedup ~8.91×**; Popcorn **936.952 μs** (official). |
+| **submission_8** (harness, session in **Version 8**) | **0.248 / 0.359 / 0.827** | **0.488 / 0.887 / 2.416** | **0.649 / 0.994 / 2.418** | **geomean speedup ~9.18×** vs eager; Popcorn **908.166 μs** (official). |
+| **submission_9** (Colab **A100 40GB**, **PyTorch 2.10.0+cu128**, **Version 9**) | **0.231 / 0.347 / 0.812** | **0.470 / 0.867 / 2.358** | **0.628 / 0.979 / 2.392** | **geomean speedup ~9.36×** vs eager; Popcorn **875.111 μs** (official). |
 
-For **competition-comparable** numbers, run **`python test_cross_entropy.py`** on each of **`submission_1.py` … `submission_7.py`**: **20** warmup, **100** runs, **three** **V** values, **geomean speedup** printed at the end.
+For **competition-comparable** numbers, run **`python test_cross_entropy.py`** on each of **`submission_1.py` … `submission_9.py`**: **20** warmup, **100** runs, **three** **V** values, **geomean speedup** printed at the end.
 
 ## Achieved memory bandwidth
 
@@ -464,6 +581,22 @@ One **`test_cross_entropy.py`** run per file on **A100 80GB**, **PyTorch 2.11.0*
 | **v7** | `submission_7.py` | 50,264 | **1140.3** | **~55.9%** | |
 | **v7** | `submission_7.py` | 128,256 | **1298.8** | **~63.7%** | |
 
+**v8 (same harness as Version 8 table — one session):**
+
+| Version | File | **V** | Fwd+Bwd BW (GB/s) | **% of 2039** | Geomean speedup (printed) |
+|--------|------|------:|------------------:|--------------:|--------------------------:|
+| **v8** | `submission_8.py` | 32,000 | **1211.5** | **~59.4%** | **~9.18×** |
+| **v8** | `submission_8.py` | 50,264 | **1242.5** | **~60.9%** | |
+| **v8** | `submission_8.py` | 128,256 | **1303.8** | **~63.9%** | |
+
+**v9 (Colab A100 40GB, PyTorch 2.10 — Version 9):**
+
+| Version | File | **V** | Fwd+Bwd BW (GB/s) | **% of 2039** | Geomean speedup (printed) |
+|--------|------|------:|------------------:|--------------:|--------------------------:|
+| **v9** | `submission_9.py` | 32,000 | **1253.0** | **~61.5%** | **~9.36×** |
+| **v9** | `submission_9.py` | 50,264 | **1262.0** | **~61.9%** | |
+| **v9** | `submission_9.py` | 128,256 | **1317.7** | **~64.6%** | |
+
 **Historical (different machine / session):** **Version 2** documents **v2** on **A100 40GB**, PyTorch **2.10** — **Fwd+Bwd BW** **491.7 / 448.3 / 416.8 GB/s** → **~24.1% / 22.0% / 20.4%** of **2039**. **Version 3** has **v2′** and **v3** Colab medians for the same **40GB** class.
 
 ### Which rows are **still** without a dedicated **% of peak** line here?
@@ -475,11 +608,11 @@ One **`test_cross_entropy.py`** run per file on **A100 80GB**, **PyTorch 2.11.0*
 
 **Colab-only microbench** (**submission_1**, **V = 128k** only): **~388.2 GB/s** combined → **~19.0%** of **2039** (non-**80GB** runtime; see **Version 1**).
 
-### Final Triton submission (**v7**) on **A100 80GB**
+### Final Triton submission (**v9**) on **A100**
 
-Official rank uses **Popcorn**; local check: **`python test_cross_entropy.py submission_7.py`**. Primary implementation: **`submission_7.py`** (**936.952 μs** Popcorn in this journal). **`submission_6.py`** remains a **no-cache** baseline (**1236.180 μs**).
+Official rank uses **Popcorn**; local check: **`python test_cross_entropy.py submission_9.py`**. Primary implementation: **`submission_9.py`** (**875.111 μs** Popcorn in this journal). **`submission_8.py`** matches the same **hand-tuned** code path (keep in sync). **`submission_7.py`** (**936.952 μs**) remains a reference with **autotune**; **`submission_6.py`** (**1236.180 μs**) remains the **no-cache** baseline.
 
-**After Popcorn / grader PyTorch 2.11**, refresh harness rows if medians shift; add **v7** rows to the **80GB** bandwidth table when you paste a full **`test_cross_entropy.py submission_7.py`** run on **80GB**.
+**After Popcorn / grader PyTorch 2.11**, refresh harness rows if medians shift; add **v9** rows to the **80GB** bandwidth table when you paste a full **`test_cross_entropy.py submission_9.py`** run on **A100 80GB**.
 
 ## Why I do not expect 100% of peak bandwidth
 
@@ -503,6 +636,8 @@ python test_cross_entropy.py submission_4.py
 python test_cross_entropy.py submission_5.py
 python test_cross_entropy.py submission_6.py
 python test_cross_entropy.py submission_7.py
+python test_cross_entropy.py submission_8.py
+python test_cross_entropy.py submission_9.py
 ```
 
 Each run: correctness for all three **V**, timings, bandwidth, geomean speedup vs eager baseline.
@@ -511,7 +646,7 @@ Each run: correctness for all three **V**, timings, bandwidth, geomean speedup v
 
 1. **Runtime → Change runtime type → GPU** (T4/L4/A100 depending on tier).
 
-2. **Upload files** to `/content` (or use Drive): `submission.py`, `submission_1.py`–`submission_7.py`, `test_cross_entropy.py`, and optionally `colab_benchmark_cross_entropy.py`.
+2. **Upload files** to `/content` (or use Drive): `submission.py`, `submission_1.py`–`submission_9.py`, `test_cross_entropy.py`, and optionally `colab_benchmark_cross_entropy.py`.
 
    ```python
    from google.colab import files
@@ -536,6 +671,8 @@ Each run: correctness for all three **V**, timings, bandwidth, geomean speedup v
    !python test_cross_entropy.py submission_5.py
    !python test_cross_entropy.py submission_6.py
    !python test_cross_entropy.py submission_7.py
+   !python test_cross_entropy.py submission_8.py
+   !python test_cross_entropy.py submission_9.py
    !python test_cross_entropy.py submission.py
    ```
 
@@ -582,7 +719,7 @@ Each run: correctness for all three **V**, timings, bandwidth, geomean speedup v
            tb.append(e0.elapsed_time(e1))
        return statistics.median(tf), statistics.median(tb)
 
-   for name, path in [("v1", "/content/submission_1.py"), ("v2", "/content/submission_2.py"), ("v3", "/content/submission_3.py"), ("v4", "/content/submission_4.py"), ("v5", "/content/submission_5.py"), ("v6", "/content/submission_6.py"), ("v7", "/content/submission_7.py")]:
+   for name, path in [("v1", "/content/submission_1.py"), ("v2", "/content/submission_2.py"), ("v3", "/content/submission_3.py"), ("v4", "/content/submission_4.py"), ("v5", "/content/submission_5.py"), ("v6", "/content/submission_6.py"), ("v7", "/content/submission_7.py"), ("v8", "/content/submission_8.py"), ("v9", "/content/submission_9.py")]:
        m = load(path)
        f, b = bench(m)
        print(name, "forward ms:", f, "backward ms:", b, "sum:", f + b)
@@ -617,17 +754,17 @@ wget https://raw.githubusercontent.com/gpu-mode/reference-kernels/main/problems/
 5. Run a correctness check:
 
 ```bash
-popcorn submit --leaderboard princeton_cross_entropy --gpu A100 --mode test submission_7.py
+popcorn submit --leaderboard princeton_cross_entropy --gpu A100 --mode test submission_9.py
 ```
 
-6. Submit an official ranked run (**best Popcorn time in this journal: `submission_7.py`**, **936.952 μs**):
+6. Submit an official ranked run (**best Popcorn time in this journal: `submission_9.py`**, **875.111 μs**):
 
 ```bash
-popcorn submit --leaderboard princeton_cross_entropy --gpu A100 --mode leaderboard submission_7.py
+popcorn submit --leaderboard princeton_cross_entropy --gpu A100 --mode leaderboard submission_9.py
 ```
 
-Alternatively: `cp submission_7.py submission.py` and submit **`submission.py`**. To submit an older version, point the command at **`submission_6.py`**, **`submission_5.py`**, **`submission_4.py`**, **`submission_2.py`**, etc.
+Alternatively: `cp submission_9.py submission.py` and submit **`submission.py`**. To submit an older version, point the command at **`submission_8.py`**, **`submission_7.py`**, **`submission_6.py`**, **`submission_5.py`**, **`submission_4.py`**, **`submission_2.py`**, etc.
 
 ## Short note to include in the notebook
 
-I documented my optimization process in this journal. I compared **submission_1** and **submission_2** (`torch.compile` + stable backward without `probs.clone()`). **submission_3** (narrow forward + `gather` under compile) **passed** correctness but was **slower** than v2 in Colab (see **Version 3**). **submission_4** implements **forward and backward in Triton** (row-parallel, tiled **V**), fixes the **`_NEG` global / Triton JIT** issue with a local sentinel, and **improved Popcorn** from **2716.164 μs (v2)** to **1992.267 μs**. **submission_5** applies an **online softmax**-style fused reduction (**one** pass for row max + sum of exponentials on forward; **two** logits passes on backward instead of **v4**’s **three**), inspired by the **Triton fused softmax** tutorial, and reached **1270.465 μs** on Popcorn. **submission_6** uses the same **v5** kernels with a **uniform `BLOCK_V = 4096`** and reached **1236.180 μs**. **submission_7** caches per-row **log ∑ e^x** from forward for backward on the same tensors, uses **`@triton.autotune`**, avoids redundant **`contiguous()`** / **`int32`** work in Python, and reached **936.952 μs** on Popcorn. **Achieved memory bandwidth** records **% of peak (2039 GB/s)** for **v1–v6** on **A100 80GB** and **v7** on **Colab A100 40GB** until an **80GB** paste exists. For upload, use **`submission_7.py`**. Avoid **`torch.compile`** on Popcorn if the server reports **multi-stream** errors. Local/Colab numbers use **`test_cross_entropy.py`**; the grader uses **PyTorch 2.11** and **Triton 3.6** on **A100 80GB**.
+I documented my optimization process in this journal. I compared **submission_1** and **submission_2** (`torch.compile` + stable backward without `probs.clone()`). **submission_3** (narrow forward + `gather` under compile) **passed** correctness but was **slower** than v2 in Colab (see **Version 3**). **submission_4** implements **forward and backward in Triton** (row-parallel, tiled **V**), fixes the **`_NEG` global / Triton JIT** issue with a local sentinel, and **improved Popcorn** from **2716.164 μs (v2)** to **1992.267 μs**. **submission_5** applies an **online softmax**-style fused reduction, and reached **1270.465 μs** on Popcorn. **submission_6** uses a **uniform `BLOCK_V = 4096`** and reached **1236.180 μs**. **submission_7** caches per-row **log ∑ e^x** and reached **936.952 μs**. **submission_8** adds **`tl.constexpr`** and **wider autotune** (**908.166 μs**). **submission_9** removes autotune in favor of a **hand-tuned `_LAUNCH`** table per competition **V** (e.g. **8192** for **32k/50k**, **16384** for **128k**), reaching **875.111 μs** on Popcorn and **~9.36×** geomean speedup vs eager on **Colab A100 40GB** / **PyTorch 2.10** (**Version 9**). **submission_8** is kept aligned with **submission_9**. **Achieved memory bandwidth** includes **v7–v9** harness rows. For upload, use **`submission_9.py`**. Avoid **`torch.compile`** on Popcorn if the server reports **multi-stream** errors. Local/Colab numbers use **`test_cross_entropy.py`**; the grader uses **PyTorch 2.11** and **Triton 3.6** on **A100 80GB**.
